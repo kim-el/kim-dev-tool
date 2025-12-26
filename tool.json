@@ -1,0 +1,56 @@
+{
+  "name": "kim_metrics",
+  "version": "1.0.0",
+  "description": "Apple Silicon system metrics tool - provides real-time power, temperature, battery, and process data",
+  "author": "Kim El",
+  "license": "MIT",
+  
+  "command": "./kim_temp_bin json",
+  "working_directory": "/Users/kimen/Projects/Apple Sillicon Benchmarking tools",
+  
+  "output_format": "json",
+  "latency_ms": 1500,
+  "token_cost": 180,
+  
+  "requires_setup": {
+    "description": "One-time setup to allow powermetrics without password",
+    "command": "echo 'YOUR_USERNAME ALL=(ALL) NOPASSWD: /usr/bin/powermetrics' | sudo tee /etc/sudoers.d/kim_metrics"
+  },
+  
+  "output_fields": {
+    "cpu_temp": "CPU temperature in Celsius",
+    "gpu_temp": "GPU temperature in Celsius",
+    "mem_temp": "Memory temperature in Celsius",
+    "ssd_temp": "SSD temperature in Celsius",
+    "bat_temp": "Battery temperature in Celsius",
+    "power_w": "Total system power draw in Watts",
+    "cpu_mw": "CPU power in milliwatts",
+    "gpu_mw": "GPU power in milliwatts",
+    "ane_mw": "Apple Neural Engine power in milliwatts",
+    "battery_pct": "Battery percentage",
+    "charging": "Whether the Mac is charging (true/false)",
+    "mem_free_pct": "Free memory percentage",
+    "efficiency_hrs": "Battery life at 100% at current power draw",
+    "wakeups_per_sec": "Total system wakeups per second",
+    "top_cpu": "Top 5 processes by CPU usage",
+    "high_wakeups": "Processes with >50 wakeups/sec (battery drainers)"
+  },
+  
+  "use_cases": [
+    "Check if system is running hot",
+    "Find battery-draining apps",
+    "Monitor power consumption during development",
+    "Optimize ANE usage for ML apps",
+    "Diagnose performance issues"
+  ],
+  
+  "example_output": {
+    "cpu_temp": 58.0,
+    "gpu_temp": 47.5,
+    "power_w": 9.04,
+    "efficiency_hrs": 5.7,
+    "high_wakeups": [
+      {"name": "language_server_macos_arm", "cpu_ms": 0.8, "wakeups": 238}
+    ]
+  }
+}
