@@ -1,0 +1,9 @@
+# Rust build artifacts
+kim_temp/target/
+
+# macOS
+.DS_Store
+
+# Temp files
+/tmp/
+*.tmp
