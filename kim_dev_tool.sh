@@ -292,6 +292,24 @@ while true; do
         power_display="N/A"
     fi
     
+    # Fallback: If Apple's time remaining is unavailable, use our calculation
+    if [ "$time_remaining" = "--:--" ] && [ "$at_100_hours" != "N/A" ] && [ "$is_charging" = "no" ]; then
+        # Calculate actual remaining time based on current battery % and power
+        remaining_wh=$(echo "scale=2; $battery_wh * $battery_pct / 100" | bc 2>/dev/null)
+        if [ -n "$remaining_wh" ] && [ -n "$real_power_w" ]; then
+            remaining_hrs=$(echo "scale=1; $remaining_wh / $real_power_w" | bc 2>/dev/null)
+            if [ -n "$remaining_hrs" ]; then
+                # Convert to h:mm format
+                hrs_int=${remaining_hrs%.*}
+                hrs_int=${hrs_int:-0}
+                mins_frac=$(echo "scale=2; ($remaining_hrs - $hrs_int) * 60" | bc 2>/dev/null)
+                mins_int=${mins_frac%.*}
+                mins_int=${mins_int:-0}
+                time_remaining=$(printf "%d:%02d (est)" "$hrs_int" "$mins_int")
+            fi
+        fi
+    fi
+    
     # Battery header with AVERAGE efficiency rating (add clear-to-end-of-line to fix artifacts)
     printf "🔋 BATTERY:    %3d%%   " "$battery_pct"
     if [ "$is_charging" = "yes" ]; then
