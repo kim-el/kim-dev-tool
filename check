@@ -1,0 +1,42 @@
+#!/bin/bash
+# Quick check commands for Apple Silicon metrics
+# Usage: ./check temp | power | battery | all
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+case "$1" in
+    temp|temperature)
+        "$SCRIPT_DIR/kim_temp_bin" cpu gpu memory ssd battery 2>/dev/null | while read line; do
+            echo "🌡️  $line"
+        done
+        ;;
+    power)
+        "$SCRIPT_DIR/kim_temp_bin" power 2>/dev/null | xargs -I {} echo "⚡ Power: {} W"
+        ;;
+    battery|batt)
+        pmset -g batt | head -2
+        ;;
+    all|"")
+        echo "=== Quick System Check ==="
+        echo ""
+        echo "🌡️  TEMPERATURES:"
+        "$SCRIPT_DIR/kim_temp_bin" cpu 2>/dev/null | xargs -I {} echo "   CPU: {}°C"
+        "$SCRIPT_DIR/kim_temp_bin" gpu 2>/dev/null | xargs -I {} echo "   GPU: {}°C"
+        "$SCRIPT_DIR/kim_temp_bin" ssd 2>/dev/null | xargs -I {} echo "   SSD: {}°C"
+        echo ""
+        echo "⚡ POWER:"
+        "$SCRIPT_DIR/kim_temp_bin" power 2>/dev/null | xargs -I {} echo "   Draw: {} W"
+        echo ""
+        echo "🔋 BATTERY:"
+        pmset -g batt | grep -oE '[0-9]+%' | head -1 | xargs -I {} echo "   Level: {}"
+        ;;
+    *)
+        echo "Usage: ./check [temp|power|battery|all]"
+        echo ""
+        echo "Examples:"
+        echo "  ./check temp    - Show temperatures"
+        echo "  ./check power   - Show power draw"
+        echo "  ./check battery - Show battery status"
+        echo "  ./check         - Show all metrics"
+        ;;
+esac
