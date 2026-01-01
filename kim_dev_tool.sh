@@ -239,14 +239,14 @@ sudo "$script_dir/kim_temp_bin" stream | while IFS= read -r line; do
     
     # Screen is diff between Battery Rail (Total) and System Logic (PSTR)
     screen_mw=$(echo "($bat_power_w - $power_w) * 1000" | bc -l | awk '{print int($1)}')
-    [ "$screen_mw" -lt 0 ] && screen_mw=0
+    if [ "$screen_mw" -lt 0 ]; then screen_mw=0; fi
     
     # Misc is System Logic - Components
     # Note: PSTR includes CPU/GPU/ANE/Memory and Logic Board overhead
     system_logic_mw=$(echo "$power_w * 1000" | bc -l | awk '{print int($1)}')
     known_components=$((cpu_mw + gpu_mw + ane_mw + mem_mw))
     misc_mw=$((system_logic_mw - known_components))
-    [ "$misc_mw" -lt 0 ] && misc_mw=0
+    if [ "$misc_mw" -lt 0 ]; then misc_mw=0; fi
     
     printf "⚡ POWER:       %s W   (Total System)\033[K\n" "$real_total_w"
     printf "   ├─ CPU:     %5d mW\033[K\n" "$cpu_mw"
