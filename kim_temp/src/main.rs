@@ -195,8 +195,10 @@ fn main() {
             
             let pstr_key = string_to_key("PSTR");
             let ppbr_key = string_to_key("PPBR");
+            let phpm_key = string_to_key("PHPM");
             let sys_power = smc.read_key::<f32>(pstr_key).unwrap_or(0.0);
             let bat_power = smc.read_key::<f32>(ppbr_key).unwrap_or(0.0);
+            let mem_power = smc.read_key::<f32>(phpm_key).unwrap_or(0.0);
             
             // Powermetrics logic (same as before)
             let pm_output = std::process::Command::new("sudo")
@@ -207,58 +209,61 @@ fn main() {
             let gpu_power_mw: i32 = pm_output.lines().find(|l| l.contains("GPU Power:")).and_then(|l| l.split_whitespace().find(|s| s.parse::<f64>().is_ok()).and_then(|s| s.parse::<f64>().ok())).map(|v| v as i32).unwrap_or(0);
             let ane_power_mw: i32 = pm_output.lines().find(|l| l.contains("ANE Power:")).and_then(|l| l.split_whitespace().find(|s| s.parse::<f64>().is_ok()).and_then(|s| s.parse::<f64>().ok())).map(|v| v as i32).unwrap_or(0);
             
-            let battery_output = std::process::Command::new("pmset").args(["-g", "batt"]).output().ok().and_then(|o| String::from_utf8(o.stdout).ok()).unwrap_or_default();
-            let battery_pct: i32 = battery_output.split('%').next().and_then(|s| s.split_whitespace().last()).and_then(|s| s.parse().ok()).unwrap_or(0);
-            let charging = battery_output.contains("; charging;") || (battery_output.contains("AC Power") && !battery_output.contains("discharging"));
+            // Battery & Mem logic... (abbreviated for brevity, but needed for full functionality)
+             let battery_output = std::process::Command::new("pmset").args(["-g", "batt"]).output().ok().and_then(|o| String::from_utf8(o.stdout).ok()).unwrap_or_default();
+             let battery_pct: i32 = battery_output.split('%').next().and_then(|s| s.split_whitespace().last()).and_then(|s| s.parse().ok()).unwrap_or(0);
+             let charging = battery_output.contains("; charging;") || (battery_output.contains("AC Power") && !battery_output.contains("discharging"));
 
-            let vm_output = std::process::Command::new("vm_stat").output().ok().and_then(|o| String::from_utf8(o.stdout).ok()).unwrap_or_default();
-            let page_size: u64 = 16384;
-            let mut free_pages: u64 = 0; let mut inactive_pages: u64 = 0; let mut speculative_pages: u64 = 0;
-            for line in vm_output.lines() {
-                if line.starts_with("Pages free:") { free_pages = line.split(':').nth(1).and_then(|s| s.trim().trim_end_matches('.').parse().ok()).unwrap_or(0); }
-                else if line.starts_with("Pages inactive:") { inactive_pages = line.split(':').nth(1).and_then(|s| s.trim().trim_end_matches('.').parse().ok()).unwrap_or(0); }
-                else if line.starts_with("Pages speculative:") { speculative_pages = line.split(':').nth(1).and_then(|s| s.trim().trim_end_matches('.').parse().ok()).unwrap_or(0); }
-            }
-            let free_bytes = (free_pages + inactive_pages + speculative_pages) * page_size;
-            let total_bytes: u64 = 16 * 1024 * 1024 * 1024;
-            let mem_free_pct = ((free_bytes as f64 / total_bytes as f64) * 100.0) as i32;
-            
-            let ioreg_output = std::process::Command::new("ioreg").args(["-r", "-c", "AppleSmartBattery"]).output().ok().and_then(|o| String::from_utf8(o.stdout).ok()).unwrap_or_default();
-            let battery_mah: f32 = ioreg_output.lines().find(|l| l.contains("\"DesignCapacity\"")).and_then(|l| l.split('=').nth(1).and_then(|s| s.trim().parse().ok())).unwrap_or(4500.0);
-            let battery_wh = battery_mah * 11.4 / 1000.0;
-            let efficiency = if sys_power > 0.1 { battery_wh / sys_power } else { 99.0 };
+             let vm_output = std::process::Command::new("vm_stat").output().ok().and_then(|o| String::from_utf8(o.stdout).ok()).unwrap_or_default();
+             let page_size: u64 = 16384;
+             let mut free_pages: u64 = 0; let mut inactive_pages: u64 = 0; let mut speculative_pages: u64 = 0;
+             for line in vm_output.lines() {
+                 if line.starts_with("Pages free:") { free_pages = line.split(':').nth(1).and_then(|s| s.trim().trim_end_matches('.').parse().ok()).unwrap_or(0); }
+                 else if line.starts_with("Pages inactive:") { inactive_pages = line.split(':').nth(1).and_then(|s| s.trim().trim_end_matches('.').parse().ok()).unwrap_or(0); }
+                 else if line.starts_with("Pages speculative:") { speculative_pages = line.split(':').nth(1).and_then(|s| s.trim().trim_end_matches('.').parse().ok()).unwrap_or(0); }
+             }
+             let free_bytes = (free_pages + inactive_pages + speculative_pages) * page_size;
+             let total_bytes: u64 = 16 * 1024 * 1024 * 1024;
+             let mem_free_pct = ((free_bytes as f64 / total_bytes as f64) * 100.0) as i32;
+             
+             let ioreg_output = std::process::Command::new("ioreg").args(["-r", "-c", "AppleSmartBattery"]).output().ok().and_then(|o| String::from_utf8(o.stdout).ok()).unwrap_or_default();
+             let battery_mah: f32 = ioreg_output.lines().find(|l| l.contains("\"DesignCapacity\"")).and_then(|l| l.split('=').nth(1).and_then(|s| s.trim().parse().ok())).unwrap_or(4500.0);
+             let battery_wh = battery_mah * 11.4 / 1000.0;
+             let efficiency = if sys_power > 0.1 { battery_wh / sys_power } else { 99.0 };
 
-            let mut total_wakeups: f64 = 0.0;
-            let mut processes: Vec<(String, f64, f64)> = Vec::new();
-            let mut in_tasks = false;
-            for line in pm_output.lines() {
-                if line.starts_with("Name") { in_tasks = true; continue; }
-                if line.starts_with("ALL_TASKS") || line.starts_with("CPU Power") { break; }
-                if in_tasks && !line.trim().is_empty() {
-                    let parts: Vec<&str> = line.split_whitespace().collect();
-                    if parts.len() >= 8 && parts[1].parse::<i32>().is_ok() {
-                        let name = parts[0].to_string();
-                        let cpu_ms: f64 = parts[2].parse().unwrap_or(0.0);
-                        let wakeups: f64 = parts[6].parse().unwrap_or(0.0);
-                        total_wakeups += wakeups;
-                        if !["kernel_task", "powerd", "powermetrics", "launchd"].contains(&parts[0]) {
+             // Process list logic...
+             let mut total_wakeups: f64 = 0.0;
+             let mut processes: Vec<(String, f64, f64)> = Vec::new();
+             let mut in_tasks = false;
+             for line in pm_output.lines() {
+                 if line.starts_with("Name") { in_tasks = true; continue; }
+                 if line.starts_with("ALL_TASKS") || line.starts_with("CPU Power") { break; }
+                 if in_tasks && !line.trim().is_empty() {
+                     let parts: Vec<&str> = line.split_whitespace().collect();
+                     if parts.len() >= 8 && parts[1].parse::<i32>().is_ok() {
+                         let name = parts[0].to_string();
+                         let cpu_ms: f64 = parts[2].parse().unwrap_or(0.0);
+                         let wakeups: f64 = parts[6].parse().unwrap_or(0.0);
+                         total_wakeups += wakeups;
+                         if !["kernel_task", "powerd", "powermetrics", "launchd"].contains(&parts[0]) {
                              processes.push((name, cpu_ms, wakeups));
-                        }
-                    }
-                }
-            }
-            processes.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-            let top_json = processes.iter().take(5).map(|(n,c,w)| format!("{{\"name\":\"{}\",\"cpu_ms\":{:.1},\"wakeups\":{:.1}}}", n, c, w)).collect::<Vec<_>>().join(",");
-            let high_wakeups_json = processes.iter().filter(|(_,_,w)| *w > 50.0).take(5).map(|(n,c,w)| format!("{{\"name\":\"{}\",\"cpu_ms\":{:.1},\"wakeups\":{:.1}}}", n, c, w)).collect::<Vec<_>>().join(",");
-            
-            println!("{{\"cpu_temp\":{:.1},\"gpu_temp\":{:.1},\"mem_temp\":{:.1},\"ssd_temp\":{:.1},\"bat_temp\":{:.1},\"power_w\":{:.2},\"bat_power_w\":{:.2},\"cpu_mw\":{},\"gpu_mw\":{},\"ane_mw\":{},\"battery_pct\":{},\"charging\":{},\"mem_free_pct\":{},\"efficiency_hrs\":{:.1},\"wakeups_per_sec\":{:.0},\"top_cpu\":[{}],\"high_wakeups\":[{}]}}",
-               cpu_avg, gpu_avg, mem_avg, ssd_avg, bat_avg, sys_power, bat_power, cpu_power_mw, gpu_power_mw, ane_power_mw, battery_pct, charging, mem_free_pct, efficiency, total_wakeups, top_json, high_wakeups_json);
+                         }
+                     }
+                 }
+             }
+             processes.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+             let top_json = processes.iter().take(5).map(|(n,c,w)| format!("{{\"name\":\"{}\",\"cpu_ms\":{:.1},\"wakeups\":{:.1}}}", n, c, w)).collect::<Vec<_>>().join(",");
+             let high_wakeups_json = processes.iter().filter(|(_,_,w)| *w > 50.0).take(5).map(|(n,c,w)| format!("{{\"name\":\"{}\",\"cpu_ms\":{:.1},\"wakeups\":{:.1}}}", n, c, w)).collect::<Vec<_>>().join(",");
+             
+             println!("{{\"cpu_temp\":{:.1},\"gpu_temp\":{:.1},\"mem_temp\":{:.1},\"ssd_temp\":{:.1},\"bat_temp\":{:.1},\"power_w\":{:.2},\"bat_power_w\":{:.2},\"mem_power_w\":{:.2},\"cpu_mw\":{},\"gpu_mw\":{},\"ane_mw\":{},\"battery_pct\":{},\"charging\":{},\"mem_free_pct\":{},\"efficiency_hrs\":{:.1},\"wakeups_per_sec\":{:.0},\"top_cpu\":[{}],\"high_wakeups\":[{}],\"}}",
+                cpu_avg, gpu_avg, mem_avg, ssd_avg, bat_avg, sys_power, bat_power, mem_power, cpu_power_mw, gpu_power_mw, ane_power_mw, battery_pct, charging, mem_free_pct, efficiency, total_wakeups, top_json, high_wakeups_json);
         }
 
         "stream" => {
             let pstr_key = string_to_key("PSTR");
             let ppbr_key = string_to_key("PPBR");
-            
+            let phpm_key = string_to_key("PHPM");
+            // One-time Setup
             let ioreg_output = std::process::Command::new("ioreg").args(["-r", "-c", "AppleSmartBattery"]).output().ok().and_then(|o| String::from_utf8(o.stdout).ok()).unwrap_or_default();
             let battery_mah: f32 = ioreg_output.lines().find(|l| l.contains("\"DesignCapacity\"")).and_then(|l| l.split('=').nth(1).and_then(|s| s.trim().parse().ok())).unwrap_or(4500.0);
             let battery_wh = battery_mah * 11.4 / 1000.0;
@@ -267,12 +272,14 @@ fn main() {
             let mut cached_top_json = String::from("[]"); let mut cached_high_wakeups_json = String::from("[]");
             let mut cycle_count = 0;
             
+            // Fetch keys ONCE for stream mode. If it fails, we continue without detailed temps.
             let keys = smc.keys().unwrap_or_default();
 
             loop {
                 cycle_count += 1;
                 let sys_power = smc.read_key::<f32>(pstr_key).unwrap_or(0.0);
                 let bat_power = smc.read_key::<f32>(ppbr_key).unwrap_or(0.0);
+                let mem_power = smc.read_key::<f32>(phpm_key).unwrap_or(0.0);
                 
                 let mut cpu_temps: Vec<f64> = Vec::new(); let mut gpu_temps: Vec<f64> = Vec::new(); let mut mem_temps: Vec<f64> = Vec::new(); let mut ssd_temps: Vec<f64> = Vec::new(); let mut bat_temps: Vec<f64> = Vec::new();
                 for key in &keys {
@@ -347,11 +354,47 @@ fn main() {
                     cached_high_wakeups_json = processes.iter().filter(|(_,_,w)| *w > 50.0).take(5).map(|(n,c,w)| format!("{{\"name\":\"{}\",\"cpu_ms\":{:.1},\"wakeups\":{:.1}}}", n, c, w)).collect::<Vec<_>>().join(",");
                 }
 
-                println!("{{\"cpu_temp\":{:.1},\"gpu_temp\":{:.1},\"mem_temp\":{:.1},\"ssd_temp\":{:.1},\"bat_temp\":{:.1},\"power_w\":{:.2},\"bat_power_w\":{:.2},\"cpu_mw\":{},\"gpu_mw\":{},\"ane_mw\":{},\"battery_pct\":{},\"charging\":{},\"mem_free_pct\":{},\"efficiency_hrs\":{:.1},\"wakeups_per_sec\":{:.0},\"top_cpu\":[{}],\"high_wakeups\":[{}]}}",
-                    cpu_avg, gpu_avg, mem_avg, ssd_avg, bat_avg, sys_power, bat_power, cached_cpu_mw, cached_gpu_mw, cached_ane_mw, battery_pct, charging, mem_free_pct, efficiency, cached_total_wakeups, cached_top_json, cached_high_wakeups_json);
+                println!("{{\"cpu_temp\":{:.1},\"gpu_temp\":{:.1},\"mem_temp\":{:.1},\"ssd_temp\":{:.1},\"bat_temp\":{:.1},\"power_w\":{:.2},\"bat_power_w\":{:.2},\"mem_power_w\":{:.2},\"cpu_mw\":{},\"gpu_mw\":{},\"ane_mw\":{},\"battery_pct\":{},\"charging\":{},\"mem_free_pct\":{},\"efficiency_hrs\":{:.1},\"wakeups_per_sec\":{:.0},\"top_cpu\":[{}],\"high_wakeups\":[{}],\"}}",
+                    cpu_avg, gpu_avg, mem_avg, ssd_avg, bat_avg, sys_power, bat_power, mem_power, cached_cpu_mw, cached_gpu_mw, cached_ane_mw, battery_pct, charging, mem_free_pct, efficiency, cached_total_wakeups, cached_top_json, cached_high_wakeups_json);
                 use std::io::Write;
                 std::io::stdout().flush().unwrap();
                 std::thread::sleep(std::time::Duration::from_millis(1000));
+            }
+        }
+        
+        "monitor" => {
+            let pstr_key = string_to_key("PSTR");
+            let ppbr_key = string_to_key("PPBR");
+            
+            let ioreg_output = std::process::Command::new("ioreg").args(["-r", "-c", "AppleSmartBattery"]).output().ok().and_then(|o| String::from_utf8(o.stdout).ok()).unwrap_or_default();
+            let battery_mah: f32 = ioreg_output.lines().find(|l| l.contains("\"DesignCapacity\"")).and_then(|l| l.split('=').nth(1).and_then(|s| s.trim().parse().ok())).unwrap_or(4500.0);
+            let battery_wh = battery_mah * 11.4 / 1000.0;
+            
+            let keys = smc.keys().unwrap_or_default();
+
+            loop {
+                let sys_power = smc.read_key::<f32>(pstr_key).unwrap_or(0.0);
+                let bat_power = smc.read_key::<f32>(ppbr_key).unwrap_or(0.0);
+                
+                let mut cpu_temps: Vec<f64> = Vec::new();
+                for key in &keys {
+                     let key_str = key_to_string(*key);
+                     if key_str.starts_with("Tp") || key_str.starts_with("Te") {
+                         if let Ok(t) = smc.temperature(*key) {
+                             if t > 0.0 && t < 120.0 {
+                                 cpu_temps.push(t);
+                             }
+                         }
+                     }
+                }
+                let cpu_temp = if !cpu_temps.is_empty() { cpu_temps.iter().sum::<f64>() / cpu_temps.len() as f64 } else { 0.0 };
+                
+                let est_hrs = if bat_power > 0.5 { battery_wh / bat_power } else { 99.9 };
+                
+                print!("\r⚡ Sys: {:.2}W | Bat: {:.2}W | 🔋 Est: {:.1}h | 🌡️  {:.1}°C      ", sys_power, bat_power, est_hrs, cpu_temp);
+                use std::io::Write;
+                std::io::stdout().flush().unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(500));
             }
         }
         
@@ -372,6 +415,7 @@ fn main() {
                 ("PBLR", "Backlight?"),
                 ("PDTR", "Display?"),
                 ("PPMR", "Memory?"),
+                ("PHPM", "Memory (System)?"),
                 ("PPBR", "Battery Rail"),
                 ("PP0b", "CPU Package?"),
                 ("PP7b", "GPU?"),

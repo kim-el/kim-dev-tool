@@ -176,7 +176,7 @@ sudo "$script_dir/kim_temp_bin" stream | while IFS= read -r line; do
     # Parse JSON into variables using jq
     # We extract everything in one go for performance
     eval $(echo "$line" | jq -r '
-        @sh "cpu_temp=\(.cpu_temp) gpu_temp=\(.gpu_temp) mem_temp=\(.mem_temp) ssd_temp=\(.ssd_temp) bat_temp=\(.bat_temp) power_w=\(.power_w) bat_power_w=\(.bat_power_w) cpu_mw=\(.cpu_mw) gpu_mw=\(.gpu_mw) ane_mw=\(.ane_mw) battery_pct=\(.battery_pct) charging=\(.charging) mem_free_pct=\(.mem_free_pct) efficiency_hrs=\(.efficiency_hrs) wakeups_per_sec=\(.wakeups_per_sec)"
+        @sh "cpu_temp=\(.cpu_temp) gpu_temp=\(.gpu_temp) mem_temp=\(.mem_temp) ssd_temp=\(.ssd_temp) bat_temp=\(.bat_temp) power_w=\(.power_w) bat_power_w=\(.bat_power_w) mem_power_w=\(.mem_power_w) cpu_mw=\(.cpu_mw) gpu_mw=\(.gpu_mw) ane_mw=\(.ane_mw) battery_pct=\(.battery_pct) charging=\(.charging) mem_free_pct=\(.mem_free_pct) efficiency_hrs=\(.efficiency_hrs) wakeups_per_sec=\(.wakeups_per_sec)"
     ')
 
     # RENDER UI (cursor home)
@@ -190,6 +190,7 @@ sudo "$script_dir/kim_temp_bin" stream | while IFS= read -r line; do
         real_total_w="$bat_power_w"
     else
         real_total_w="$power_w"
+        bat_power_w="$power_w"
     fi
 
     # --- BATTERY SECTION ---
@@ -200,17 +201,7 @@ sudo "$script_dir/kim_temp_bin" stream | while IFS= read -r line; do
     fi
 
     # Re-calculate efficiency using the better power number
-    # Battery Wh is approx 52Wh (MBA) to 70Wh (MBP 14) to 100Wh (MBP 16)
-    # We use a safe average of 60Wh if we can't get it, or trust the tool's eff_hrs if power matches
-    # Since we have better power now, let's just do:
     if [ $(echo "$real_total_w > 0.5" | bc -l) -eq 1 ]; then
-        # Use the efficiency_hrs from tool but scale it if the tool used PSTR instead of PPBR
-        # Actually, let's just trust the tool's efficiency_hrs if it was updated to use PPBR?
-        # My Rust change didn't update the efficiency calculation in Rust to use PPBR.
-        # So I should recalculate it here.
-        # Let's assume ~60Wh capacity for now as a baseline or 52Wh for Air.
-        # Better: The tool sends efficiency_hrs based on PSTR.
-        # Recalc: new_eff = old_eff * (PSTR / PPBR)
         avg_100_hours=$(echo "$efficiency_hrs * $power_w / $real_total_w" | bc -l)
     else
         avg_100_hours="99.9"
@@ -243,16 +234,27 @@ sudo "$script_dir/kim_temp_bin" stream | while IFS= read -r line; do
     echo ""
     
     # --- POWER SECTION ---
-    total_sys_mw=$(echo "$real_total_w * 1000" | bc -l | awk '{print int($1)}')
-    soc_mw=$((cpu_mw + gpu_mw + ane_mw))
-    other_mw=$((total_sys_mw - soc_mw))
-    [ "$other_mw" -lt 0 ] && other_mw=0
+    # Calculations
+    mem_mw=$(echo "$mem_power_w * 1000" | bc -l | awk '{print int($1)}')
+    
+    # Screen is diff between Battery Rail (Total) and System Logic (PSTR)
+    screen_mw=$(echo "($bat_power_w - $power_w) * 1000" | bc -l | awk '{print int($1)}')
+    [ "$screen_mw" -lt 0 ] && screen_mw=0
+    
+    # Misc is System Logic - Components
+    # Note: PSTR includes CPU/GPU/ANE/Memory and Logic Board overhead
+    system_logic_mw=$(echo "$power_w * 1000" | bc -l | awk '{print int($1)}')
+    known_components=$((cpu_mw + gpu_mw + ane_mw + mem_mw))
+    misc_mw=$((system_logic_mw - known_components))
+    [ "$misc_mw" -lt 0 ] && misc_mw=0
     
     printf "⚡ POWER:       %s W   (Total System)\033[K\n" "$real_total_w"
     printf "   ├─ CPU:     %5d mW\033[K\n" "$cpu_mw"
     printf "   ├─ GPU:     %5d mW\033[K\n" "$gpu_mw"
+    printf "   ├─ Memory:  %5d mW\033[K\n" "$mem_mw"
     printf "   ├─ ANE:     %5d mW\033[K\n" "$ane_mw"
-    printf "   └─ Other:   %5d mW   (Display, SSD, WiFi, etc)\033[K\n" "$other_mw"
+    printf "   ├─ Screen:  %5d mW   (Est. from rail diff)\033[K\n" "$screen_mw"
+    printf "   └─ Misc:    %5d mW   (WiFi, SSD, Losses)\033[K\n" "$misc_mw"
     
     echo ""
     
