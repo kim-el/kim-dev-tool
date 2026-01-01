@@ -176,7 +176,7 @@ sudo "$script_dir/kim_temp_bin" stream | while IFS= read -r line; do
     # Parse JSON into variables using jq
     # We extract everything in one go for performance
     eval $(echo "$line" | jq -r '
-        @sh "cpu_temp=\(.cpu_temp) gpu_temp=\(.gpu_temp) mem_temp=\(.mem_temp) ssd_temp=\(.ssd_temp) bat_temp=\(.bat_temp) power_w=\(.power_w) cpu_mw=\(.cpu_mw) gpu_mw=\(.gpu_mw) ane_mw=\(.ane_mw) battery_pct=\(.battery_pct) charging=\(.charging) mem_free_pct=\(.mem_free_pct) efficiency_hrs=\(.efficiency_hrs) wakeups_per_sec=\(.wakeups_per_sec)"
+        @sh "cpu_temp=\(.cpu_temp) gpu_temp=\(.gpu_temp) mem_temp=\(.mem_temp) ssd_temp=\(.ssd_temp) bat_temp=\(.bat_temp) power_w=\(.power_w) bat_power_w=\(.bat_power_w) cpu_mw=\(.cpu_mw) gpu_mw=\(.gpu_mw) ane_mw=\(.ane_mw) battery_pct=\(.battery_pct) charging=\(.charging) mem_free_pct=\(.mem_free_pct) efficiency_hrs=\(.efficiency_hrs) wakeups_per_sec=\(.wakeups_per_sec)"
     ')
 
     # RENDER UI (cursor home)
@@ -185,6 +185,13 @@ sudo "$script_dir/kim_temp_bin" stream | while IFS= read -r line; do
     echo "           🔬 KIM_DEV_TOOL: Apple Silicon Truth Monitor"
     echo "========================================================================"
     
+    # Use Battery Rail Power if available (more accurate), otherwise fallback to System Power
+    if [ "$bat_power_w" != "0.00" ] && [ "$bat_power_w" != "null" ]; then
+        real_total_w="$bat_power_w"
+    else
+        real_total_w="$power_w"
+    fi
+
     # --- BATTERY SECTION ---
     if [ "$charging" = "true" ]; then
         is_charging="yes"
@@ -192,15 +199,26 @@ sudo "$script_dir/kim_temp_bin" stream | while IFS= read -r line; do
         is_charging="no"
     fi
 
-    # Format efficiency hours
-    avg_100_hours="$efficiency_hrs"
+    # Re-calculate efficiency using the better power number
+    # Battery Wh is approx 52Wh (MBA) to 70Wh (MBP 14) to 100Wh (MBP 16)
+    # We use a safe average of 60Wh if we can't get it, or trust the tool's eff_hrs if power matches
+    # Since we have better power now, let's just do:
+    if [ $(echo "$real_total_w > 0.5" | bc -l) -eq 1 ]; then
+        # Use the efficiency_hrs from tool but scale it if the tool used PSTR instead of PPBR
+        # Actually, let's just trust the tool's efficiency_hrs if it was updated to use PPBR?
+        # My Rust change didn't update the efficiency calculation in Rust to use PPBR.
+        # So I should recalculate it here.
+        # Let's assume ~60Wh capacity for now as a baseline or 52Wh for Air.
+        # Better: The tool sends efficiency_hrs based on PSTR.
+        # Recalc: new_eff = old_eff * (PSTR / PPBR)
+        avg_100_hours=$(echo "$efficiency_hrs * $power_w / $real_total_w" | bc -l)
+    else
+        avg_100_hours="99.9"
+    fi
     
-    # Calculate Time Left (Simple estimation based on current power)
-    # Note: kim_temp_bin handles the efficiency calc, but we can do a simple projection here
-    # Efficiency_hrs is @100%, so Time Left = Efficiency_hrs * (Battery% / 100)
-    if [ "$power_w" != "0.00" ]; then
-        time_left_hrs=$(echo "$efficiency_hrs * $battery_pct / 100" | bc -l)
-        # Format as H:MM
+    # Calculate Time Left
+    if [ $(echo "$real_total_w > 0" | bc -l) -eq 1 ]; then
+        time_left_hrs=$(echo "$avg_100_hours * $battery_pct / 100" | bc -l)
         hrs_int=$(echo "$time_left_hrs" | awk '{print int($1)}')
         mins_int=$(echo "($time_left_hrs - $hrs_int) * 60" | bc -l | awk '{print int($1)}')
         time_remaining=$(printf "%d:%02d" "$hrs_int" "$mins_int")
@@ -218,19 +236,19 @@ sudo "$script_dir/kim_temp_bin" stream | while IFS= read -r line; do
     else
         printf "\033[31m(@100%%: %.1fh - heavy!)\033[0m\033[K\n" "$avg_100_hours"
     fi
-    printf "   ├─ Power Draw:  %s W\033[K\n" "$power_w"
+    printf "   ├─ Power Draw:  %s W\033[K\n" "$real_total_w"
     printf "   ├─ Time Left:   %s (est)\033[K\n" "$time_remaining"
-    printf "   └─ Live @100%%: %.1fh\033[K\n" "$efficiency_hrs" # Using same value as it is now 1s update
+    printf "   └─ Live @100%%: %.1fh\033[K\n" "$avg_100_hours"
     
     echo ""
     
     # --- POWER SECTION ---
-    total_sys_mw=$(echo "$power_w * 1000" | bc -l | awk '{print int($1)}')
+    total_sys_mw=$(echo "$real_total_w * 1000" | bc -l | awk '{print int($1)}')
     soc_mw=$((cpu_mw + gpu_mw + ane_mw))
     other_mw=$((total_sys_mw - soc_mw))
     [ "$other_mw" -lt 0 ] && other_mw=0
     
-    printf "⚡ POWER:       %s W   (Total System)\033[K\n" "$power_w"
+    printf "⚡ POWER:       %s W   (Total System)\033[K\n" "$real_total_w"
     printf "   ├─ CPU:     %5d mW\033[K\n" "$cpu_mw"
     printf "   ├─ GPU:     %5d mW\033[K\n" "$gpu_mw"
     printf "   ├─ ANE:     %5d mW\033[K\n" "$ane_mw"
