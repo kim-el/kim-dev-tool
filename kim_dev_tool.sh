@@ -155,278 +155,126 @@ echo ""
 sleep 0.5
 
 # ==============================================================================
-# MAIN MONITORING LOOP
+# MAIN MONITORING LOOP (STREAM MODE)
 # ==============================================================================
-while true; do
-    # 1. CAPTURE METRICS
-    if ! powermetrics -i "$SAMPLE_TIME" -n 1 --samplers tasks,cpu_power,gpu_power,ane_power,thermal 2>/dev/null > "$TMP_FILE"; then
-        echo "⚠️  Capture failed, retrying..."
-        sleep 1
+
+# Ensure kim_temp_bin exists
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ ! -x "$script_dir/kim_temp_bin" ]; then
+    echo "❌ Error: kim_temp_bin not found. Please compile it first."
+    exit 1
+fi
+
+# Run the stream and pipe it into our loop
+# This avoids restarting processes every second
+sudo "$script_dir/kim_temp_bin" stream | while IFS= read -r line; do
+    # Skip non-JSON lines (startup messages)
+    if [[ ! "$line" =~ ^\{ ]]; then
         continue
     fi
-    
-    # Validate output
-    if [ ! -s "$TMP_FILE" ]; then
-        echo "⚠️  Empty output, retrying..."
-        sleep 1
-        continue
-    fi
-    
-    # 2. PARSE POWER METRICS
-    total_watts=$(extract_power "Combined Power|System Power|Package Power")
-    cpu_watts=$(extract_power "CPU Power")
-    gpu_watts=$(extract_power "GPU Power")
-    ane_watts=$(extract_power "ANE Power")
-    
-    total_watts=$(to_int "$total_watts")
-    cpu_watts=$(to_int "$cpu_watts")
-    gpu_watts=$(to_int "$gpu_watts")
-    ane_watts=$(to_int "$ane_watts")
-    
-    watts_delta=$((total_watts - base_watts))
-    
-    # 3. PARSE E-CLUSTER / P-CLUSTER (if available)
-    e_cluster=$(extract_power "E-Cluster Power")
-    p_cluster=$(extract_power "P-Cluster Power")
-    e_cluster=$(to_int "$e_cluster")
-    p_cluster=$(to_int "$p_cluster")
-    
-    # 4. PARSE WAKEUPS (Column 7 = Intr wakeups, from "Wakeups (Intr, Pkg idle)")
-    # Format: Name ID CPU_ms/s User% Deadlines(<2ms) Deadlines(2-5ms) Wakeups(Intr) Wakeups(PkgIdle)
-    wakeups=$(awk '
-        /^Name/ { in_tasks=1; next }
-        /^ALL_TASKS/ { exit }
-        /^CPU Power/ { exit }
-        in_tasks && NF >= 8 && $2 ~ /^[0-9]+$/ {
-            # $7 is Intr wakeups column
-            sum += $7
-        }
-        END { printf "%.0f", sum+0 }
-    ' "$TMP_FILE")
-    wakeups="${wakeups:-0}"
-    
-    # 5. MEMORY PRESSURE
-    mem_info=$(get_memory_pressure)
-    mem_state=$(echo "$mem_info" | cut -d'|' -f1)
-    mem_pct=$(echo "$mem_info" | cut -d'|' -f2)
-    
-    # 6. THERMAL
-    thermal=$(get_thermal)
-    
-    # 7. RENDER UI (cursor home - overwrite in place for smooth updates)
-    printf "\033[H"  # Move cursor to top-left, overwrite existing content
+
+    # Parse JSON into variables using jq
+    # We extract everything in one go for performance
+    eval $(echo "$line" | jq -r '
+        @sh "cpu_temp=\(.cpu_temp) gpu_temp=\(.gpu_temp) mem_temp=\(.mem_temp) ssd_temp=\(.ssd_temp) bat_temp=\(.bat_temp) power_w=\(.power_w) cpu_mw=\(.cpu_mw) gpu_mw=\(.gpu_mw) ane_mw=\(.ane_mw) battery_pct=\(.battery_pct) charging=\(.charging) mem_free_pct=\(.mem_free_pct) efficiency_hrs=\(.efficiency_hrs) wakeups_per_sec=\(.wakeups_per_sec)"
+    ')
+
+    # RENDER UI (cursor home)
+    printf "\033[H"
     echo "========================================================================"
     echo "           🔬 KIM_DEV_TOOL: Apple Silicon Truth Monitor"
     echo "========================================================================"
     
-    # Get script directory and real system power for calculations
-    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    if [ -x "$script_dir/kim_temp_bin" ]; then
-        real_power_w=$("$script_dir/kim_temp_bin" power 2>/dev/null)
-    else
-        real_power_w=""
-    fi
-    
-    # ==================== BATTERY SECTION (TOP) ====================
-    battery_info=$(pmset -g batt 2>/dev/null)
-    battery_pct=$(echo "$battery_info" | grep -oE '[0-9]+%' | head -1 | tr -d '%')
-    battery_pct=${battery_pct:-0}
-    time_remaining=$(echo "$battery_info" | grep -oE '[0-9]+:[0-9]+' | head -1)
-    time_remaining=${time_remaining:-"--:--"}
-    # More robust charging detection - look for "; charging;" pattern
-    if echo "$battery_info" | grep -q "; charging;"; then
+    # --- BATTERY SECTION ---
+    if [ "$charging" = "true" ]; then
         is_charging="yes"
-    elif echo "$battery_info" | grep -q "AC Power"; then
-        # On AC but might be "charged" or "finishing charge"
-        if echo "$battery_info" | grep -q "charged\|finishing"; then
-            is_charging="no"
-        else
-            is_charging="yes"
-        fi
     else
         is_charging="no"
     fi
+
+    # Format efficiency hours
+    avg_100_hours="$efficiency_hrs"
     
-    # Calculate @100% hours (efficiency metric)
-    # Get battery design capacity dynamically (works for all Mac models)
-    battery_mah=$(ioreg -r -c AppleSmartBattery 2>/dev/null | grep -oE '"DesignCapacity" = [0-9]+' | grep -oE '[0-9]+' | head -1)
-    battery_mah=${battery_mah:-4500}  # Fallback
-    # Convert mAh to Wh using nominal voltage 11.4V (3-cell Li-ion)
-    battery_wh=$(echo "scale=1; $battery_mah * 11.4 / 1000" | bc 2>/dev/null)
-    battery_wh=${battery_wh:-52}  # Fallback to 52
-    
-    if [ -n "$real_power_w" ] && [ "$real_power_w" != "N/A" ]; then
-        # Live efficiency (instant)
-        at_100_hours=$(echo "scale=1; $battery_wh / $real_power_w" | bc 2>/dev/null)
-        at_100_hours=${at_100_hours:-0}
-        power_display=$(printf "%.1f" "$real_power_w")
-        
-        # Add to power history for 10-min average
-        echo "$real_power_w" >> "$POWER_HISTORY_FILE"
-        # Keep only last MAX_HISTORY_SAMPLES entries
-        if [ -f "$POWER_HISTORY_FILE" ]; then
-            tail -n "$MAX_HISTORY_SAMPLES" "$POWER_HISTORY_FILE" > "${POWER_HISTORY_FILE}.tmp"
-            mv "${POWER_HISTORY_FILE}.tmp" "$POWER_HISTORY_FILE"
-        fi
-        
-        # Calculate 10-minute average
-        if [ -f "$POWER_HISTORY_FILE" ]; then
-            sample_count=$(wc -l < "$POWER_HISTORY_FILE" | tr -d ' ')
-            if [ "$sample_count" -gt 0 ]; then
-                avg_power=$(awk '{ sum += $1; count++ } END { if (count > 0) printf "%.2f", sum/count; else print "0" }' "$POWER_HISTORY_FILE")
-                avg_100_hours=$(echo "scale=1; $battery_wh / $avg_power" | bc 2>/dev/null)
-                avg_100_hours=${avg_100_hours:-0}
-                # Show time window (how many minutes of data we have)
-                time_window_mins=$((sample_count / 60))
-                [ "$time_window_mins" -lt 1 ] && time_window_mins=1
-            else
-                avg_100_hours="$at_100_hours"
-                time_window_mins=0
-            fi
-        else
-            avg_100_hours="$at_100_hours"
-            time_window_mins=0
-        fi
+    # Calculate Time Left (Simple estimation based on current power)
+    # Note: kim_temp_bin handles the efficiency calc, but we can do a simple projection here
+    # Efficiency_hrs is @100%, so Time Left = Efficiency_hrs * (Battery% / 100)
+    if [ "$power_w" != "0.00" ]; then
+        time_left_hrs=$(echo "$efficiency_hrs * $battery_pct / 100" | bc -l)
+        # Format as H:MM
+        hrs_int=$(echo "$time_left_hrs" | awk '{print int($1)}')
+        mins_int=$(echo "($time_left_hrs - $hrs_int) * 60" | bc -l | awk '{print int($1)}')
+        time_remaining=$(printf "%d:%02d" "$hrs_int" "$mins_int")
     else
-        at_100_hours="N/A"
-        power_display="N/A"
+        time_remaining="--:--"
     fi
-    
-    # Fallback: If Apple's time remaining is unavailable, use our calculation
-    if [ "$time_remaining" = "--:--" ] && [ "$at_100_hours" != "N/A" ] && [ "$is_charging" = "no" ]; then
-        # Calculate actual remaining time based on current battery % and power
-        remaining_wh=$(echo "scale=2; $battery_wh * $battery_pct / 100" | bc 2>/dev/null)
-        if [ -n "$remaining_wh" ] && [ -n "$real_power_w" ]; then
-            remaining_hrs=$(echo "scale=1; $remaining_wh / $real_power_w" | bc 2>/dev/null)
-            if [ -n "$remaining_hrs" ]; then
-                # Convert to h:mm format
-                hrs_int=${remaining_hrs%.*}
-                hrs_int=${hrs_int:-0}
-                mins_frac=$(echo "scale=2; ($remaining_hrs - $hrs_int) * 60" | bc 2>/dev/null)
-                mins_int=${mins_frac%.*}
-                mins_int=${mins_int:-0}
-                time_remaining=$(printf "%d:%02d (est)" "$hrs_int" "$mins_int")
-            fi
-        fi
-    fi
-    
-    # Battery header with AVERAGE efficiency rating (add clear-to-end-of-line to fix artifacts)
+
     printf "🔋 BATTERY:    %3d%%   " "$battery_pct"
     if [ "$is_charging" = "yes" ]; then
         printf "\033[32m(Charging)\033[0m\033[K\n"
-    elif [ "$avg_100_hours" != "N/A" ] && [ -n "$avg_100_hours" ]; then
-        avg_100_int=${avg_100_hours%.*}
-        avg_100_int=${avg_100_int:-0}
-        if [ "$avg_100_int" -ge 12 ]; then
-            printf "(@100%%: %sh) ✅\033[K\n" "$avg_100_hours"
-        elif [ "$avg_100_int" -ge 6 ]; then
-            printf "\033[33m(@100%%: %sh)\033[0m\033[K\n" "$avg_100_hours"
-        else
-            printf "\033[31m(@100%%: %sh - heavy!)\033[0m\033[K\n" "$avg_100_hours"
-        fi
+    elif [ $(echo "$avg_100_hours >= 12" | bc -l) -eq 1 ]; then
+        printf "(@100%%: %.1fh) ✅\033[K\n" "$avg_100_hours"
+    elif [ $(echo "$avg_100_hours >= 6" | bc -l) -eq 1 ]; then
+        printf "\033[33m(@100%%: %.1fh)\033[0m\033[K\n" "$avg_100_hours"
     else
-        printf "\033[K\n"
+        printf "\033[31m(@100%%: %.1fh - heavy!)\033[0m\033[K\n" "$avg_100_hours"
     fi
-    printf "   ├─ Power Draw:  %s W\033[K\n" "$power_display"
-    printf "   ├─ Time Left:   %s\033[K\n" "$time_remaining"
-    # Show LIVE efficiency (instant reading)
-    if [ "$at_100_hours" != "N/A" ]; then
-        at_100_int=${at_100_hours%.*}
-        if [ "$at_100_int" -ge 12 ]; then
-            printf "   └─ Live @100%%: \033[32m%sh\033[0m\033[K\n" "$at_100_hours"
-        elif [ "$at_100_int" -ge 6 ]; then
-            printf "   └─ Live @100%%: \033[33m%sh\033[0m\033[K\n" "$at_100_hours"
-        else
-            printf "   └─ Live @100%%: \033[31m%sh\033[0m\033[K\n" "$at_100_hours"
-        fi
-    else
-        printf "   └─ Live @100%%: N/A\033[K\n"
-    fi
+    printf "   ├─ Power Draw:  %s W\033[K\n" "$power_w"
+    printf "   ├─ Time Left:   %s (est)\033[K\n" "$time_remaining"
+    printf "   └─ Live @100%%: %.1fh\033[K\n" "$efficiency_hrs" # Using same value as it is now 1s update
     
     echo ""
     
-    # ==================== POWER SECTION ====================
-    # Use real system power from SMC (already in real_power_w from battery section)
-    if [ -n "$real_power_w" ] && [ "$real_power_w" != "N/A" ]; then
-        total_sys_w=$(printf "%.2f" "$real_power_w")
-        total_sys_mw=$(echo "$real_power_w * 1000" | bc 2>/dev/null | cut -d. -f1)
-        total_sys_mw=${total_sys_mw:-0}
-        # Calculate "Other" power (Display, SSD, WiFi, etc)
-        soc_mw=$((cpu_watts + gpu_watts + ane_watts))
-        other_mw=$((total_sys_mw - soc_mw))
-        [ "$other_mw" -lt 0 ] && other_mw=0
-    else
-        total_sys_w="N/A"
-        total_sys_mw=0
-        other_mw=0
-    fi
+    # --- POWER SECTION ---
+    total_sys_mw=$(echo "$power_w * 1000" | bc -l | awk '{print int($1)}')
+    soc_mw=$((cpu_mw + gpu_mw + ane_mw))
+    other_mw=$((total_sys_mw - soc_mw))
+    [ "$other_mw" -lt 0 ] && other_mw=0
     
-    printf "⚡ POWER:       %s W   " "$total_sys_w"
-    printf "(Total System)\n"
-    if [ "$e_cluster" -gt 0 ] || [ "$p_cluster" -gt 0 ]; then
-        printf "   ├─ CPU:     %5d mW   [E: %d | P: %d]\n" "$cpu_watts" "$e_cluster" "$p_cluster"
-    else
-        printf "   ├─ CPU:     %5d mW\n" "$cpu_watts"
-    fi
-    printf "   ├─ GPU:     %5d mW\n" "$gpu_watts"
-    printf "   ├─ ANE:     %5d mW\n" "$ane_watts"
-    printf "   └─ Other:   %5d mW   (Display, SSD, WiFi, etc)\n" "$other_mw"
+    printf "⚡ POWER:       %s W   (Total System)\033[K\n" "$power_w"
+    printf "   ├─ CPU:     %5d mW\033[K\n" "$cpu_mw"
+    printf "   ├─ GPU:     %5d mW\033[K\n" "$gpu_mw"
+    printf "   ├─ ANE:     %5d mW\033[K\n" "$ane_mw"
+    printf "   └─ Other:   %5d mW   (Display, SSD, WiFi, etc)\033[K\n" "$other_mw"
     
     echo ""
     
-    # ==================== THERMAL SECTION ====================
-    # Get all temperatures from our kim_temp_bin
-    if [ -x "$script_dir/kim_temp_bin" ]; then
-        cpu_temp=$("$script_dir/kim_temp_bin" cpu 2>/dev/null)
-        gpu_temp=$("$script_dir/kim_temp_bin" gpu 2>/dev/null)
-        mem_temp=$("$script_dir/kim_temp_bin" memory 2>/dev/null)
-        ssd_temp=$("$script_dir/kim_temp_bin" ssd 2>/dev/null)
-        batt_temp=$("$script_dir/kim_temp_bin" battery 2>/dev/null)
-        hottest_temp=${cpu_temp:-0}
-    else
-        cpu_temp="N/A"; gpu_temp="N/A"; mem_temp="N/A"; ssd_temp="N/A"; batt_temp="N/A"
-        hottest_temp="N/A"
-    fi
+    # --- THERMAL SECTION ---
+    # Find hottest
+    hottest_temp=$cpu_temp # Simple default
+    if [ $(echo "$gpu_temp > $hottest_temp" | bc -l) -eq 1 ]; then hottest_temp=$gpu_temp; fi
     
-    # Thermal header with hottest component
     printf "🌡️  THERMAL:    "
-    if [ "$hottest_temp" != "N/A" ]; then
-        hottest_int=${hottest_temp%.*}
-        if [ "$hottest_int" -lt 60 ]; then
-            printf "\033[32m%s°C\033[0m   (Target: <60°C) ✅\n" "$hottest_temp"
-        elif [ "$hottest_int" -lt 80 ]; then
-            printf "\033[33m%s°C\033[0m   (Target: <60°C)\n" "$hottest_temp"
-        else
-            printf "\033[31m%s°C\033[0m   (Target: <60°C - Throttling!)\n" "$hottest_temp"
-        fi
+    if [ $(echo "$hottest_temp < 60" | bc -l) -eq 1 ]; then
+        printf "\033[32m%.1f°C\033[0m   (Target: <60°C) ✅\033[K\n" "$hottest_temp"
+    elif [ $(echo "$hottest_temp < 80" | bc -l) -eq 1 ]; then
+        printf "\033[33m%.1f°C\033[0m   (Target: <60°C)\033[K\n" "$hottest_temp"
     else
-        printf "N/A\n"
+        printf "\033[31m%.1f°C\033[0m   (Target: <60°C - Throttling!)\033[K\n" "$hottest_temp"
     fi
     
-    # Component breakdown
-    printf "   ├─ CPU:      %6s°C\n" "${cpu_temp:-N/A}"
-    printf "   ├─ GPU:      %6s°C\n" "${gpu_temp:-N/A}"
-    printf "   ├─ Memory:   %6s°C\n" "${mem_temp:-N/A}"
-    printf "   ├─ SSD:      %6s°C\n" "${ssd_temp:-N/A}"
-    printf "   └─ Battery:  %6s°C\n" "${batt_temp:-N/A}"
+    printf "   ├─ CPU:      %6.1f°C\033[K\n" "$cpu_temp"
+    printf "   ├─ GPU:      %6.1f°C\033[K\n" "$gpu_temp"
+    printf "   ├─ Memory:   %6.1f°C\033[K\n" "$mem_temp"
+    printf "   ├─ SSD:      %6.1f°C\033[K\n" "$ssd_temp"
+    printf "   └─ Battery:  %6.1f°C\033[K\n" "$bat_temp"
     
     echo ""
     
-    # ==================== MEMORY SECTION ====================
-    printf "🧠 MEMORY:     %d%% free   " "$mem_pct"
-    if [ "$mem_pct" -gt 30 ]; then
-        printf "(Target: >30%%) ✅\n"
-    elif [ "$mem_pct" -gt 15 ]; then
-        printf "\033[33m(Target: >30%%)\033[0m\n"
+    # --- MEMORY SECTION ---
+    printf "🧠 MEMORY:     %d%% free   " "$mem_free_pct"
+    if [ "$mem_free_pct" -gt 30 ]; then
+        printf "(Target: >30%%) ✅\033[K\n"
+    elif [ "$mem_free_pct" -gt 15 ]; then
+        printf "\033[33m(Target: >30%%)\033[0m\033[K\n"
     else
-        printf "\033[31m(Target: >30%%)\033[0m\n"
+        printf "\033[31m(Target: >30%%)\033[0m\033[K\n"
     fi
     
-    # ==================== WAKEUPS SECTION ====================
-    printf "💤 WAKEUPS:    %5d/s   " "$wakeups"
-    if [ "$wakeups" -lt 500 ]; then
+    # --- WAKEUPS SECTION ---
+    printf "💤 WAKEUPS:    %5d/s   " "$wakeups_per_sec"
+    if [ "$wakeups_per_sec" -lt 500 ]; then
         printf "(Target: <500/s) ✅\033[K\n"
-    elif [ "$wakeups" -lt 1000 ]; then
+    elif [ "$wakeups_per_sec" -lt 1000 ]; then
         printf "\033[33m(Target: <500/s)\033[0m\033[K\n"
     else
         printf "\033[31m(Target: <500/s)\033[0m\033[K\n"
@@ -434,28 +282,13 @@ while true; do
     
     echo ""
     echo "------------------------------------------------------------------------"
-    
-    # Process Attribution
-    printf "%-35s | %10s | %10s\n" "TOP PROCESSES" "CPU ms/s" "WAKEUPS"
+    printf "%-35s | %10s | %10s\033[K\n" "TOP PROCESSES (Updates every 5s)" "CPU ms/s" "WAKEUPS"
     echo "------------------------------------------------------------------------"
     
-    # Process list parsing
-    # Format: Name ID CPU_ms/s User% Deadlines(<2ms) Deadlines(2-5ms) Wakeups(Intr) Wakeups(PkgIdle)
-    awk '
-        /^Name/ { in_tasks=1; next }
-        /^ALL_TASKS/ { exit }
-        /^CPU Power/ { exit }
-        in_tasks && NF >= 8 && $2 ~ /^[0-9]+$/ {
-            name = $1
-            cpu_ms = $3
-            wkp = $7
-            printf "%s|%s|%s\n", cpu_ms, wkp, name
-        }
-    ' "$TMP_FILE" | sort -t'|' -k1 -rn | head -8 | while IFS='|' read -r cpu wkp name; do
-        # Only map system processes that have cryptic names
-        # User apps should show their real name (no guessing!)
+    # Parse top_cpu JSON array
+    echo "$line" | jq -r '.top_cpu[] | "\(.name)|\(.cpu_ms)|\(.wakeups)"' | while IFS='|' read -r name cpu wkp; do
+        # Friendly Name Logic (Copied from original)
         case "$name" in
-            # macOS System Processes (cryptic names that need translation)
             *WindowServer*) friendly_name="macOS Display" ;;
             *kernel_task*) friendly_name="macOS Kernel" ;;
             *mdworker*|*mds*|*mds_stores*) friendly_name="Spotlight Search" ;;
@@ -484,54 +317,37 @@ while true; do
             *nsurlsessiond*) friendly_name="URL Session" ;;
             *symptomsd*) friendly_name="Diagnostics" ;;
             *apsd*) friendly_name="Apple Push" ;;
-            # Keep everything else as-is (real app names)
             *) friendly_name="$name" ;;
         esac
         
-        # Truncate name
         name_short=$(printf "%.33s" "$friendly_name")
         
         # Color based on CPU usage
-        if awk -v n="$cpu" 'BEGIN { exit (n > 50) ? 0 : 1 }' 2>/dev/null; then
-            printf "\033[31m%-35s | %10s | %10s\033[0m\n" "$name_short" "$cpu" "$wkp"
-        elif awk -v n="$cpu" 'BEGIN { exit (n > 20) ? 0 : 1 }' 2>/dev/null; then
-            printf "\033[33m%-35s | %10s | %10s\033[0m\n" "$name_short" "$cpu" "$wkp"
+        if [ $(echo "$cpu > 50" | bc -l) -eq 1 ]; then
+            printf "\033[31m%-35s | %10.1f | %10.1f\033[0m\033[K\n" "$name_short" "$cpu" "$wkp"
+        elif [ $(echo "$cpu > 20" | bc -l) -eq 1 ]; then
+            printf "\033[33m%-35s | %10.1f | %10.1f\033[0m\033[K\n" "$name_short" "$cpu" "$wkp"
         else
-            printf "%-35s | %10s | %10s\n" "$name_short" "$cpu" "$wkp"
+            printf "%-35s | %10.1f | %10.1f\033[K\n" "$name_short" "$cpu" "$wkp"
         fi
     done
     
     echo "------------------------------------------------------------------------"
     
-    # BATTERY IMPACT ANALYSIS
-    # Find high-wakeup offenders (>100 wakeups/sec, excluding system processes)
-    battery_killers=$(awk '
-        /^Name/ { in_tasks=1; next }
-        /^ALL_TASKS/ { exit }
-        /^CPU Power/ { exit }
-        in_tasks && NF >= 8 && $2 ~ /^[0-9]+$/ {
-            name = $1
-            wkp = $7
-            # Skip known system processes
-            if (name ~ /^(kernel_task|WindowServer|powermetrics|launchd)$/) next
-            # Only report high wakeup offenders
-            if (wkp > 100) {
-                printf "%s (%.0f/s)\n", name, wkp
-            }
-        }
-    ' "$TMP_FILE")
-    
-    if [ -n "$battery_killers" ]; then
-        printf "\n\033[33m🔋 BATTERY IMPACT:\033[0m Apps with high wakeups (>100/s):\n"
-        echo "$battery_killers" | head -3 | while read -r line; do
-            # Just show the line as-is - no guessing
-            printf "   ⚠️  %s\n" "$line"
+    # Battery Impact (High Wakeups)
+    impact_count=$(echo "$line" | jq '.high_wakeups | length')
+    if [ "$impact_count" -gt 0 ]; then
+        printf "\n\033[33m🔋 BATTERY IMPACT:\033[0m Apps with high wakeups (>50/s):\033[K\n"
+        echo "$line" | jq -r '.high_wakeups[] | "\(.name) (\(.wakeups)/s)"' | head -3 | while read -r row; do
+            printf "   ⚠️  %s\033[K\n" "$row"
         done
-        printf "   \033[2m→ These apps prevent deep sleep and drain battery faster\033[0m\n"
+        printf "   \033[2m→ These apps prevent deep sleep and drain battery faster\033[0m\033[K\n"
+    else
+         # Clear previous lines if no impact
+         printf "\033[K\n\033[K\n\033[K\n"
     fi
-    
+
     echo "------------------------------------------------------------------------"
-    printf "⏱️  Sampling every %dms | Ctrl+C to exit\n" "$SAMPLE_TIME"
+    printf "⏱️  Power/Temps: 1s (SMC) | Processes: 5s (Low Observer Effect)\033[K\n"
     
-    sleep 0.1
 done
