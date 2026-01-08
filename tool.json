@@ -41,7 +41,8 @@
     "Find battery-draining apps",
     "Monitor power consumption during development",
     "Optimize ANE usage for ML apps",
-    "Diagnose performance issues"
+    "Diagnose performance issues",
+    "Measure application power impact (Delta)"
   ],
   
   "example_output": {

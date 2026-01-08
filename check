@@ -1,0 +1,20 @@
+#!/bin/bash
+
+# check: Unified entry point for Apple Silicon Benchmarking Tools
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+case "$1" in
+    temp)
+        sudo "$SCRIPT_DIR/kim_dev_tool.sh"
+        ;;
+    delta)
+        "$SCRIPT_DIR/kim_temp_bin" json
+        ;;
+    *)
+        echo "Usage: check {temp|delta}"
+        echo "  temp  - Run the human-readable monitor dashboard"
+        echo "  delta - Run the LLM-readable JSON snapshot"
+        exit 1
+        ;;
+esac

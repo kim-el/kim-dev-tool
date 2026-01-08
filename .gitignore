@@ -7,3 +7,6 @@ kim_temp/target/
 # Temp files
 /tmp/
 *.tmp
+*.log
+kim_temp_bin
+!/kim_temp_bin

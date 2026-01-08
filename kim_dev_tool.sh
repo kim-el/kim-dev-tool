@@ -65,6 +65,7 @@ sudo "$script_dir/kim_temp_bin" stream | while IFS= read -r line; do
     power_w=$(echo "$line" | jq -r '.power_w')
     bat_power_w=$(echo "$line" | jq -r '.bat_power_w')
     mem_power_w=$(echo "$line" | jq -r '.mem_power_w')
+    display_w=$(echo "$line" | jq -r '.display_w // 0')
     
     cpu_mw=$(echo "$line" | jq -r '.cpu_mw')
     gpu_mw=$(echo "$line" | jq -r '.gpu_mw')
@@ -127,13 +128,12 @@ sudo "$script_dir/kim_temp_bin" stream | while IFS= read -r line; do
     echo ""
     
     # Power Breakdown
-    # Screen is diff between Battery Rail (Total) and System Logic (PSTR)
-    screen_mw=$(echo "($bat_power_w - $power_w) * 1000" | bc -l | awk '{print int($1)}')
-    [ $(echo "$screen_mw < 0" | bc -l) -eq 1 ] && screen_mw=0
+    # Display power from SMC formula (PHPS - CPU - GPU - Memory)
+    screen_mw=$(echo "$display_w * 1000" | bc -l | awk '{print int($1)}')
+    [ $(echo "$screen_mw < 100" | bc -l) -eq 1 ] && [ $(echo "$bat_power_w > $power_w" | bc -l) -eq 1 ] && screen_mw=$(echo "($bat_power_w - $power_w) * 1000" | bc -l | awk '{print int($1)}')
     
     # Misc is System Logic - Components
     # Note: PSTR includes CPU/GPU/ANE/Memory and Logic Board overhead
-    # We stopped subtracting Memory (0.8W static) because the sensor was fake.
     system_logic_mw=$(echo "$power_w * 1000" | bc -l | awk '{print int($1)}')
     known_components=$((cpu_mw + gpu_mw + ane_mw))
     misc_mw=$((system_logic_mw - known_components))
@@ -143,7 +143,7 @@ sudo "$script_dir/kim_temp_bin" stream | while IFS= read -r line; do
     printf "   ├─ CPU:     %5d mW\033[K\n" "$cpu_mw"
     printf "   ├─ GPU:     %5d mW\033[K\n" "$gpu_mw"
     printf "   ├─ ANE:     %5d mW\033[K\n" "$ane_mw"
-    printf "   ├─ Screen:  %5d mW   (Est. from rail diff)\033[K\n" "$screen_mw"
+    printf "   ├─ Display: %5d mW   (Est. from SoC rail)\033[K\n" "$screen_mw"
     printf "   └─ Misc:    %5d mW   (Memory, WiFi, SSD, Losses)\033[K\n" "$misc_mw"
     
     echo ""

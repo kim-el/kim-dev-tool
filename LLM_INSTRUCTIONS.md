@@ -2,6 +2,9 @@
 
 If you are an AI assistant (Claude, Gemini, ChatGPT) asked to use this tool, please follow these patterns to ensure efficiency and accuracy.
 
+Something not in the top CPU or wakeup list does not mean it its not a resorce killer.
+
+
 ---
 
 ## 1. Quick Status Check (The Standard)
@@ -62,7 +65,29 @@ jq -r '.top_cpu[0].name' /tmp/power_log.jsonl | sort | uniq -c | sort -nr
 
 ---
 
-## 3. Troubleshooting "Zero" Values
+## 3. Benchmarking Workflow (The Delta Method)
+
+If the user says "Measure the impact of App X" or "How much power does this use?":
+
+1. **Establish Baseline**
+   - Ensure the app is **closed**.
+   - Run: `./check delta`
+   - Store the `power_w` and `wakeups_per_sec` as `BASELINE`.
+
+2. **User Action**
+   - Ask the user: *"Baseline recorded. Please start [App Name] now and let me know when it is ready."*
+
+3. **Measure Load**
+   - Once the user confirms, run: `./check delta`
+   - Store `power_w` and `wakeups_per_sec` as `LOAD`.
+
+4. **Report Results**
+   - Calculate: `LOAD - BASELINE = IMPACT`
+   - Report: *"App X increases power consumption by ~[IMPACT] W and adds ~[WAKEUPS] wakeups/sec."*
+
+---
+
+## 4. Troubleshooting "Zero" Values
 
 - **Screen Power = 0?** This happens if `bat_power_w` (Battery) reads slightly lower than `power_w` (System) due to sensor timing. Treat it as "Low/Idle".
 - **Misc Power = 0?** Same reason. Sensors are asynchronous.
@@ -70,7 +95,7 @@ jq -r '.top_cpu[0].name' /tmp/power_log.jsonl | sort | uniq -c | sort -nr
 
 ---
 
-## 4. Key Capabilities (What you can see)
+## 5. Key Capabilities (What you can see)
 
 | Metric | Source | Accuracy |
 |--------|--------|----------|
