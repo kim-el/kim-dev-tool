@@ -144,8 +144,8 @@ sudo "$script_dir/kim_temp_bin" stream | while IFS= read -r line; do
     printf "   ├─ CPU:     %5d mW\033[K\n" "$cpu_mw"
     printf "   ├─ GPU:     %5d mW\033[K\n" "$gpu_mw"
     printf "   ├─ ANE:     %5d mW\033[K\n" "$ane_mw"
-    printf "   ├─ Display: %5d mW   (Est. from System - Components)\033[K\n" "$screen_mw"
-    printf "   └─ Misc:    %5d mW   (Memory, WiFi, SSD, Losses)\033[K\n" "$misc_mw"
+    printf "   ├─ Memory:  %5d mW\033[K\n" "$misc_mw"
+    printf "   └─ Disp+Sys:%5d mW   (Screen + WiFi/SSD/Idle)\033[K\n" "$screen_mw"
     
     echo ""
     

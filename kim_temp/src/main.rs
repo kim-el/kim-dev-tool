@@ -93,10 +93,8 @@ fn main() {
             let page_size: u64 = std::process::Command::new("pagesize").output().ok().and_then(|o| String::from_utf8(o.stdout).ok()).and_then(|s| s.trim().parse().ok()).unwrap_or(16384);
 
             let keys = smc.keys().unwrap_or_default();
-            let mut cycle = 0;
             
             loop {
-                cycle += 1;
                 let sys_power = smc.read_key::<f32>(pstr_key).unwrap_or(0.0);
                 let bat_power = smc.read_key::<f32>(ppbr_key).unwrap_or(0.0);
                 let phps = smc.read_key::<f32>(phps_key).unwrap_or(0.0);
@@ -104,8 +102,7 @@ fn main() {
                 let cpu_smc = smc.read_key::<f32>(pp0b_key).unwrap_or(0.0);
                 let gpu_smc = smc.read_key::<f32>(pp7b_key).unwrap_or(0.0);
                 
-                // Formula: Display power is the remainder of the System rail
-                let display_w = (phps - cpu_smc - gpu_smc - mem_power).max(0.0);
+                let _display_w_placeholder = (phps - cpu_smc - gpu_smc - mem_power).max(0.0);
                 
                 let mut cpu_temps = Vec::new(); let mut gpu_temps = Vec::new(); let mut mem_temps = Vec::new(); let mut ssd_temps = Vec::new(); let mut bat_temps = Vec::new();
                 for key in &keys {
@@ -243,6 +240,50 @@ fn main() {
              }
         }
 
-        _ => { println!("Usage: kim_temp [cpu|gpu|power|json|stream|monitor|monitor-p]"); }
+        "trigger" => {
+            // Default threshold: 500mW
+            let threshold_mw = args.get(2).and_then(|s| s.parse::<f32>().ok()).unwrap_or(500.0);
+            // Default interval: 100ms (10Hz)
+            let interval_ms = args.get(3).and_then(|s| s.parse::<u64>().ok()).unwrap_or(100);
+            
+            let pstr_key = string_to_key("PSTR");
+            let phpm_key = string_to_key("PHPM");
+            let pp0b_key = string_to_key("PP0b");
+            let pp7b_key = string_to_key("PP7b");
+
+            // Use PSTR (Total System) for maximum sensitivity to backlight + pixels
+            let get_disp_mw = |smc: &SMC| -> f32 {
+                let total = smc.read_key::<f32>(pstr_key).unwrap_or(0.0);
+                let mem = smc.read_key::<f32>(phpm_key).unwrap_or(0.0);
+                let cpu = smc.read_key::<f32>(pp0b_key).unwrap_or(0.0);
+                let gpu = smc.read_key::<f32>(pp7b_key).unwrap_or(0.0);
+                ((total - cpu - gpu - mem).max(0.0)) * 1000.0
+            };
+
+            let mut last_stable = get_disp_mw(&smc);
+            
+            // Smoothing: Exponential Moving Average (EMA)
+            let alpha = 0.2; 
+            let mut smoothed_val = last_stable;
+
+            loop {
+                let raw_current = get_disp_mw(&smc);
+                smoothed_val = alpha * raw_current + (1.0 - alpha) * smoothed_val;
+                
+                let delta = (smoothed_val - last_stable).abs();
+
+                if delta > threshold_mw {
+                    println!("{{\"event\":\"content_change\",\"delta_mw\":{:.0},\"current_mw\":{:.0}}}", delta, smoothed_val);
+                    last_stable = smoothed_val;
+                    std::thread::sleep(std::time::Duration::from_millis(1000)); 
+                }
+                
+                use std::io::Write;
+                std::io::stdout().flush().unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(interval_ms));
+            }
+        }
+
+        _ => { println!("Usage: kim_temp [cpu|gpu|power|json|stream|monitor|monitor-p|trigger <threshold_mw> <interval_ms>]"); }
     }
 }
