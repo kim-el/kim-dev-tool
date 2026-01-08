@@ -128,14 +128,15 @@ sudo "$script_dir/kim_temp_bin" stream | while IFS= read -r line; do
     echo ""
     
     # Power Breakdown
-    # Display power from SMC formula (PHPS - CPU - GPU - Memory)
+    # Display power from SMC formula (PSTR - CPU - GPU - ANE - Memory)
+    # This is now calculated accurately in Rust binary
     screen_mw=$(echo "$display_w * 1000" | bc -l | awk '{print int($1)}')
-    [ $(echo "$screen_mw < 100" | bc -l) -eq 1 ] && [ $(echo "$bat_power_w > $power_w" | bc -l) -eq 1 ] && screen_mw=$(echo "($bat_power_w - $power_w) * 1000" | bc -l | awk '{print int($1)}')
     
     # Misc is System Logic - Components
     # Note: PSTR includes CPU/GPU/ANE/Memory and Logic Board overhead
+    # We subtract estimated components to find the "Losses/WiFi/Fan" overhead
     system_logic_mw=$(echo "$power_w * 1000" | bc -l | awk '{print int($1)}')
-    known_components=$((cpu_mw + gpu_mw + ane_mw))
+    known_components=$((cpu_mw + gpu_mw + ane_mw + screen_mw))
     misc_mw=$((system_logic_mw - known_components))
     [ "$misc_mw" -lt 0 ] && misc_mw=0
     
@@ -143,7 +144,7 @@ sudo "$script_dir/kim_temp_bin" stream | while IFS= read -r line; do
     printf "   ├─ CPU:     %5d mW\033[K\n" "$cpu_mw"
     printf "   ├─ GPU:     %5d mW\033[K\n" "$gpu_mw"
     printf "   ├─ ANE:     %5d mW\033[K\n" "$ane_mw"
-    printf "   ├─ Display: %5d mW   (Est. from SoC rail)\033[K\n" "$screen_mw"
+    printf "   ├─ Display: %5d mW   (Est. from System - Components)\033[K\n" "$screen_mw"
     printf "   └─ Misc:    %5d mW   (Memory, WiFi, SSD, Losses)\033[K\n" "$misc_mw"
     
     echo ""

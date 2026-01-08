@@ -20,11 +20,11 @@ A high-efficiency benchmarking tool for Apple Silicon, focusing on power (Watts)
   - `check delta`: Runs the LLM-readable JSON snapshot.
   - **Completed**: Created `/Users/kimen/Projects/Apple-Silicon-Benchmarking-tools/check` and made it executable.
 - **2026-01-07T02:22:00+08:00**: Task completed. Unified `check` entry point is now live.
-- **2026-01-09**: Discovered accurate Display Power measurement via `PHPS` SMC key.
-  - **Findings**: `PHPS` (Package High Power Source) on Apple Silicon reflects the combined power of SoC and Display.
-  - **Formula**: `Display Power = (PHPS - CPU - GPU - Memory).max(0)`.
-  - **Verification**: Confirmed `PHPS` jumps significantly with brightness (up to 20W at Max brightness) while sub-components stay stable.
-  - **Update**: Integrated `display_w` into `kim_temp_bin` JSON/stream and updated `kim_dev_tool.sh` UI.
+- **2026-01-09**: Verified accurate Display Power measurement.
+  - **Findings**: The screen power is on the Main System Rail (`PSTR`) but not the Package Rail (`PHPS`).
+  - **Formula**: `Display Power = (System_Total_PSTR - CPU - GPU - ANE - Memory).max(0)`.
+  - **Verification**: User test confirmed `Est_Display` jumped by ~10W when toggling brightness to MAX, while CPU/GPU remained idle.
+  - **Implementation**: Updated `kim_temp_bin` to use this formula for `display_w`.
 
 ## Known Issues
 - **2026-01-08**: User reported `check delta` returning "check temp".
