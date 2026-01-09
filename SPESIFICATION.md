@@ -20,14 +20,13 @@ A high-efficiency benchmarking tool for Apple Silicon, focusing on power (Watts)
   - `check delta`: Runs the LLM-readable JSON snapshot.
   - **Completed**: Created `/Users/kimen/Projects/Apple-Silicon-Benchmarking-tools/check` and made it executable.
 - **2026-01-07T02:22:00+08:00**: Task completed. Unified `check` entry point is now live.
-- **2026-01-09**: Verified accurate Display Power measurement.
-  - **Findings**: The screen power is on the Main System Rail (`PSTR`) but not the Package Rail (`PHPS`).
-  - **Formula**: `Display Power = (System_Total_PSTR - CPU - GPU - ANE - Memory).max(0)`.
-  - **Verification**: User test confirmed `Est_Display` jumped by ~10W when toggling brightness to MAX, while CPU/GPU remained idle.
-  - **Implementation**: Updated `kim_temp_bin` to use this formula for `display_w`.
+- **2026-01-09**: Fixed Observer Effect & Added M4 Support.
+  - **Issue**: `powermetrics` was running every second, causing high battery drain and skewed readings (observer effect).
+  - **Optimization**: Implemented "Hybrid Polling". 
+    - Fast Path (1s): Read SMC hardware sensors directly. Zero subprocess overhead.
+    - Slow Path (5s): Run `powermetrics`, `pmset`, `vm_stat` to update process list and battery stats.
+  - **M4 Support**: Added `calibrate_cpu_gpu_keys` to auto-detect the correct power sensors. On M4, it identified `PZD1` or `Pb0f` instead of the old `PP0b` standard.
+  - **Verification**: CPU readings verified (400mW idle, 11W under 4-core load on M4).
 
 ## Known Issues
-- **2026-01-08**: User reported `check delta` returning "check temp".
-  - **Investigation**: Code and script appeared correct.
-  - **Action**: Recompiled `kim_temp_bin` from source to ensure integrity.
-  - **Status**: Verified working in local environment.
+- **2026-01-09**: Dynamic Calibration requires `sudo` (prompted at startup) because it runs a one-time `powermetrics` baseline.

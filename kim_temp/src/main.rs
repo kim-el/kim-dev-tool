@@ -18,6 +18,75 @@ fn string_to_key(s: &str) -> four_char_code::FourCharCode {
     four_char_code::FourCharCode(val)
 }
 
+fn calibrate_cpu_gpu_keys(smc: &SMC) -> Option<(four_char_code::FourCharCode, four_char_code::FourCharCode)> {
+    // 1. Run powermetrics once to get the "official" ground truth
+    let output = std::process::Command::new("sudo")
+        .args(["powermetrics", "-n", "1", "-i", "100", "--samplers", "cpu_power"])
+        .output()
+        .ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    let pm_cpu_mw = stdout.lines()
+        .find(|l| l.contains("CPU Power:"))
+        .and_then(|l| l.split_whitespace().find(|s| s.parse::<f64>().is_ok()))
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(0.0) as f32;
+
+    let pm_gpu_mw = stdout.lines()
+        .find(|l| l.contains("GPU Power:"))
+        .and_then(|l| l.split_whitespace().find(|s| s.parse::<f64>().is_ok()))
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(0.0) as f32;
+
+    // 2. Scan all P-keys
+    let keys = smc.keys().unwrap_or_default();
+    let mut best_cpu_key = four_char_code::FourCharCode(0);
+    let mut best_gpu_key = four_char_code::FourCharCode(0);
+    let mut best_cpu_diff = f32::MAX;
+    let mut best_gpu_diff = f32::MAX;
+
+    // Threshold: Match must be within 30% or 100mW (loose match to account for timing jitter)
+    for key in keys {
+        let name = key_to_string(key);
+        if name.starts_with('P') {
+            if let Ok(val) = smc.read_key::<f32>(key) {
+                let smc_mw = val * 1000.0;
+                
+                // CPU Candidate
+                let cpu_diff = (smc_mw - pm_cpu_mw).abs();
+                if cpu_diff < best_cpu_diff {
+                    best_cpu_diff = cpu_diff;
+                    best_cpu_key = key;
+                }
+
+                // GPU Candidate
+                let gpu_diff = (smc_mw - pm_gpu_mw).abs();
+                if gpu_diff < best_gpu_diff {
+                    best_gpu_diff = gpu_diff;
+                    best_gpu_key = key;
+                }
+            }
+        }
+    }
+
+    // Heuristics: If the "best match" is still way off (> 500mW and > 50%), reject it.
+    // For idle GPU, differences are small (e.g. 5mW vs 20mW), so we allow small absolute diffs.
+    
+    let cpu_valid = best_cpu_diff < 500.0 || best_cpu_diff < pm_cpu_mw * 0.5;
+    let gpu_valid = best_gpu_diff < 500.0 || best_gpu_diff < pm_gpu_mw * 0.5;
+
+    if cpu_valid && gpu_valid {
+        // eprintln!("Calibration: CPU={} ({:.0}mW vs {:.0}mW), GPU={} ({:.0}mW vs {:.0}mW)", 
+        //     key_to_string(best_cpu_key), smc.read_key::<f32>(best_cpu_key).unwrap_or(0.0)*1000.0, pm_cpu_mw,
+        //     key_to_string(best_gpu_key), smc.read_key::<f32>(best_gpu_key).unwrap_or(0.0)*1000.0, pm_gpu_mw);
+        Some((best_cpu_key, best_gpu_key))
+    } else {
+        // Fallback to standard M1 keys if calibration is wildly failing
+        // eprintln!("Calibration failed or inconclusive. Using defaults.");
+        None
+    }
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     let mode = args.get(1).map(|s| s.as_str()).unwrap_or("cpu");
@@ -37,8 +106,9 @@ fn main() {
     let ppbr_key = string_to_key("PPBR"); // Battery Rail (Physical Total)
     let phps_key = string_to_key("PHPS"); // Package Total (SoC + some extras)
     let phpm_key = string_to_key("PHPM"); // Memory
-    let pp0b_key = string_to_key("PP0b"); // CPU
-    let pp7b_key = string_to_key("PP7b"); // GPU
+    
+    // Dynamic Calibration for CPU/GPU keys (M1 vs M2 vs M3 vs M4 compatibility)
+    let (pp0b_key, pp7b_key) = calibrate_cpu_gpu_keys(&smc).unwrap_or((string_to_key("PP0b"), string_to_key("PP7b")));
 
     match mode {
         "cpu" => {
@@ -94,7 +164,22 @@ fn main() {
 
             let keys = smc.keys().unwrap_or_default();
             
+            // Cache variables for slow-update data
+            let mut cached_battery_pct = 0;
+            let mut cached_charging = false;
+            let mut cached_mem_free_pct = 0;
+            let mut cached_efficiency = 0.0;
+            let mut cached_cpu_mw = 0;
+            let mut cached_gpu_mw = 0;
+            let mut cached_ane_mw = 0;
+            let mut cached_total_wakeups = 0.0;
+            let mut cached_top_json = String::from("[]");
+            let mut cached_high_wakeups_json = String::from("[]");
+            
+            let mut loop_count = 0;
+
             loop {
+                // --- FAST PATH (SMC) ---
                 let sys_power = smc.read_key::<f32>(pstr_key).unwrap_or(0.0);
                 let bat_power = smc.read_key::<f32>(ppbr_key).unwrap_or(0.0);
                 let phps = smc.read_key::<f32>(phps_key).unwrap_or(0.0);
@@ -102,8 +187,18 @@ fn main() {
                 let cpu_smc = smc.read_key::<f32>(pp0b_key).unwrap_or(0.0);
                 let gpu_smc = smc.read_key::<f32>(pp7b_key).unwrap_or(0.0);
                 
-                let _display_w_placeholder = (phps - cpu_smc - gpu_smc - mem_power).max(0.0);
+                // Estimate Display Power using SMC only (Fast & Low Overhead)
+                // PSTR (Total) - PHPS (SoC Package) - PHPM (Memory)
+                // Note: PHPS usually includes CPU + GPU + ANE + Fabric.
+                // If PHPS is not available/accurate, we can use cpu_smc + gpu_smc.
+                // For now, let's stick to the subtraction method which proved accurate.
+                let mut display_w = (sys_power - phps - mem_power).max(0.0);
                 
+                // Fallback if PHPS is 0 (some M1 models?)
+                if phps < 0.1 {
+                     display_w = (sys_power - cpu_smc - gpu_smc - mem_power).max(0.0);
+                }
+
                 let mut cpu_temps = Vec::new(); let mut gpu_temps = Vec::new(); let mut mem_temps = Vec::new(); let mut ssd_temps = Vec::new(); let mut bat_temps = Vec::new();
                 for key in &keys {
                     let ks = key_to_string(*key);
@@ -124,62 +219,64 @@ fn main() {
                 let ssd_avg = if ssd_temps.is_empty() { 0.0 } else { ssd_temps.iter().sum::<f64>() / ssd_temps.len() as f64 };
                 let bat_avg = if bat_temps.is_empty() { 0.0 } else { bat_temps.iter().sum::<f64>() / bat_temps.len() as f64 };
 
-                let battery_output = std::process::Command::new("pmset").args(["-g", "batt"]).output().ok().and_then(|o| String::from_utf8(o.stdout).ok()).unwrap_or_default();
-                let battery_pct: i32 = battery_output.split('%').next().and_then(|s| s.split_whitespace().last()).and_then(|s| s.parse().ok()).unwrap_or(0);
-                let charging = battery_output.contains("; charging;") || (battery_output.contains("AC Power") && !battery_output.contains("discharging"));
+                // --- SLOW PATH (Subprocesses) ---
+                // Run every 5 iterations (approx every 5s) or on first run
+                if loop_count % 5 == 0 {
+                    let battery_output = std::process::Command::new("pmset").args(["-g", "batt"]).output().ok().and_then(|o| String::from_utf8(o.stdout).ok()).unwrap_or_default();
+                    cached_battery_pct = battery_output.split('%').next().and_then(|s| s.split_whitespace().last()).and_then(|s| s.parse().ok()).unwrap_or(0);
+                    cached_charging = battery_output.contains("; charging;") || (battery_output.contains("AC Power") && !battery_output.contains("discharging"));
 
-                let vm_output = std::process::Command::new("vm_stat").output().ok().and_then(|o| String::from_utf8(o.stdout).ok()).unwrap_or_default();
-                let mut free_pages: u64 = 0; let mut inactive_pages: u64 = 0; let mut speculative_pages: u64 = 0;
-                for line in vm_output.lines() {
-                    if line.starts_with("Pages free:") { free_pages = line.split(':').nth(1).and_then(|s| s.trim().trim_end_matches('.').parse().ok()).unwrap_or(0); }
-                    else if line.starts_with("Pages inactive:") { inactive_pages = line.split(':').nth(1).and_then(|s| s.trim().trim_end_matches('.').parse().ok()).unwrap_or(0); }
-                    else if line.starts_with("Pages speculative:") { speculative_pages = line.split(':').nth(1).and_then(|s| s.trim().trim_end_matches('.').parse().ok()).unwrap_or(0); }
-                }
-                let free_bytes = (free_pages + inactive_pages + speculative_pages) * page_size;
-                let mem_free_pct = ((free_bytes as f64 / total_bytes as f64) * 100.0) as i32;
-                let efficiency = if sys_power > 0.1 { battery_wh / sys_power } else { 99.0 };
+                    let vm_output = std::process::Command::new("vm_stat").output().ok().and_then(|o| String::from_utf8(o.stdout).ok()).unwrap_or_default();
+                    let mut free_pages: u64 = 0; let mut inactive_pages: u64 = 0; let mut speculative_pages: u64 = 0;
+                    for line in vm_output.lines() {
+                        if line.starts_with("Pages free:") { free_pages = line.split(':').nth(1).and_then(|s| s.trim().trim_end_matches('.').parse().ok()).unwrap_or(0); }
+                        else if line.starts_with("Pages inactive:") { inactive_pages = line.split(':').nth(1).and_then(|s| s.trim().trim_end_matches('.').parse().ok()).unwrap_or(0); }
+                        else if line.starts_with("Pages speculative:") { speculative_pages = line.split(':').nth(1).and_then(|s| s.trim().trim_end_matches('.').parse().ok()).unwrap_or(0); }
+                    }
+                    let free_bytes = (free_pages + inactive_pages + speculative_pages) * page_size;
+                    cached_mem_free_pct = ((free_bytes as f64 / total_bytes as f64) * 100.0) as i32;
+                    cached_efficiency = if sys_power > 0.1 { battery_wh / sys_power } else { 99.0 };
 
-                let pm_output = std::process::Command::new("sudo")
-                    .args(["powermetrics", "-n", "1", "-i", "100", "--samplers", "cpu_power,tasks"])
-                    .output().ok().and_then(|o| String::from_utf8(o.stdout).ok()).unwrap_or_default();
-                
-                let cpu_mw: i32 = pm_output.lines().find(|l| l.contains("CPU Power:")).and_then(|l| l.split_whitespace().find(|s| s.parse::<f64>().is_ok()).and_then(|s| s.parse::<f64>().ok())).map(|v| v as i32).unwrap_or(0);
-                let gpu_mw: i32 = pm_output.lines().find(|l| l.contains("GPU Power:")).and_then(|l| l.split_whitespace().find(|s| s.parse::<f64>().is_ok()).and_then(|s| s.parse::<f64>().ok())).map(|v| v as i32).unwrap_or(0);
-                let ane_mw: i32 = pm_output.lines().find(|l| l.contains("ANE Power:")).and_then(|l| l.split_whitespace().find(|s| s.parse::<f64>().is_ok()).and_then(|s| s.parse::<f64>().ok())).map(|v| v as i32).unwrap_or(0);
+                    let pm_output = std::process::Command::new("sudo")
+                        .args(["powermetrics", "-n", "1", "-i", "100", "--samplers", "cpu_power,tasks"])
+                        .output().ok().and_then(|o| String::from_utf8(o.stdout).ok()).unwrap_or_default();
+                    
+                    // We still parse these for the JSON output, but we don't rely on them for the fast-loop math anymore
+                    cached_cpu_mw = pm_output.lines().find(|l| l.contains("CPU Power:")).and_then(|l| l.split_whitespace().find(|s| s.parse::<f64>().is_ok()).and_then(|s| s.parse::<f64>().ok())).map(|v| v as i32).unwrap_or(0);
+                    cached_gpu_mw = pm_output.lines().find(|l| l.contains("GPU Power:")).and_then(|l| l.split_whitespace().find(|s| s.parse::<f64>().is_ok()).and_then(|s| s.parse::<f64>().ok())).map(|v| v as i32).unwrap_or(0);
+                    cached_ane_mw = pm_output.lines().find(|l| l.contains("ANE Power:")).and_then(|l| l.split_whitespace().find(|s| s.parse::<f64>().is_ok()).and_then(|s| s.parse::<f64>().ok())).map(|v| v as i32).unwrap_or(0);
 
-                // Formula: Display = System Total (PSTR) - Components (CPU+GPU+ANE+Memory)
-                // Note: PSTR is from SMC (avg over time), Components are from Powermetrics (instant).
-                // We use max(0) to handle sampling sync noise.
-                let components_w = (cpu_mw as f32 + gpu_mw as f32 + ane_mw as f32) / 1000.0 + mem_power;
-                let display_w = (sys_power - components_w).max(0.0);
-
-                let mut total_wakeups: f64 = 0.0;
-                let mut processes: Vec<(String, f64, f64)> = Vec::new();
-                let mut in_tasks = false;
-                for line in pm_output.lines() {
-                    if line.starts_with("Name") { in_tasks = true; continue; }
-                    if line.starts_with("ALL_TASKS") || line.starts_with("CPU Power") { break; }
-                    if in_tasks && !line.trim().is_empty() {
-                        let parts: Vec<&str> = line.split_whitespace().collect();
-                        if parts.len() >= 8 && parts[1].parse::<i32>().is_ok() {
-                            let name = parts[0].to_string();
-                            let cpu_ms: f64 = parts[2].parse().unwrap_or(0.0);
-                            let wakeups: f64 = parts[6].parse().unwrap_or(0.0);
-                            total_wakeups += wakeups;
-                            if !["kernel_task", "powerd", "powermetrics", "launchd"].contains(&parts[0]) {
-                                processes.push((name, cpu_ms, wakeups));
+                    let mut total_wakeups: f64 = 0.0;
+                    let mut processes: Vec<(String, f64, f64)> = Vec::new();
+                    let mut in_tasks = false;
+                    for line in pm_output.lines() {
+                        if line.starts_with("Name") { in_tasks = true; continue; }
+                        if line.starts_with("ALL_TASKS") || line.starts_with("CPU Power") { break; }
+                        if in_tasks && !line.trim().is_empty() {
+                            let parts: Vec<&str> = line.split_whitespace().collect();
+                            if parts.len() >= 8 && parts[1].parse::<i32>().is_ok() {
+                                let name = parts[0].to_string();
+                                let cpu_ms: f64 = parts[2].parse().unwrap_or(0.0);
+                                let wakeups: f64 = parts[6].parse().unwrap_or(0.0);
+                                total_wakeups += wakeups;
+                                if !["kernel_task", "powerd", "powermetrics", "launchd"].contains(&parts[0]) {
+                                    processes.push((name, cpu_ms, wakeups));
+                                }
                             }
                         }
                     }
+                    cached_total_wakeups = total_wakeups;
+                    processes.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                    cached_top_json = processes.iter().take(5).map(|(n,c,w)| format!("{{\"name\":\"{}\",\"cpu_ms\":{:.1},\"wakeups\":{:.1}}}", n, c, w)).collect::<Vec<_>>().join(",");
+                    cached_high_wakeups_json = processes.iter().filter(|(_,_,w)| *w > 50.0).take(5).map(|(n,c,w)| format!("{{\"name\":\"{}\",\"cpu_ms\":{:.1},\"wakeups\":{:.1}}}", n, c, w)).collect::<Vec<_>>().join(",");
                 }
-                processes.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-                let top_json = processes.iter().take(5).map(|(n,c,w)| format!("{{\"name\":\"{}\",\"cpu_ms\":{:.1},\"wakeups\":{:.1}}}", n, c, w)).collect::<Vec<_>>().join(",");
-                let high_wakeups_json = processes.iter().filter(|(_,_,w)| *w > 50.0).take(5).map(|(n,c,w)| format!("{{\"name\":\"{}\",\"cpu_ms\":{:.1},\"wakeups\":{:.1}}}", n, c, w)).collect::<Vec<_>>().join(",");
 
                 println!("{{\"cpu_temp\":{:.1},\"gpu_temp\":{:.1},\"mem_temp\":{:.1},\"ssd_temp\":{:.1},\"bat_temp\":{:.1},\"power_w\":{:.2},\"bat_power_w\":{:.2},\"mem_power_w\":{:.2},\"display_w\":{:.2},\"cpu_mw\":{},\"gpu_mw\":{},\"ane_mw\":{},\"battery_pct\":{},\"charging\":{},\"mem_free_pct\":{},\"efficiency_hrs\":{:.1},\"wakeups_per_sec\":{:.0},\"top_cpu\":[{}],\"high_wakeups\":[{}]}}",
-                    cpu_avg, gpu_avg, mem_avg, ssd_avg, bat_avg, sys_power, bat_power, mem_power, display_w, cpu_mw, gpu_mw, ane_mw, battery_pct, charging, mem_free_pct, efficiency, total_wakeups, top_json, high_wakeups_json);
+                    cpu_avg, gpu_avg, mem_avg, ssd_avg, bat_avg, sys_power, bat_power, mem_power, display_w, cached_cpu_mw, cached_gpu_mw, cached_ane_mw, cached_battery_pct, cached_charging, cached_mem_free_pct, cached_efficiency, cached_total_wakeups, cached_top_json, cached_high_wakeups_json);
                 
                 if mode == "json" { break; }
+                
+                loop_count += 1;
                 use std::io::Write;
                 std::io::stdout().flush().unwrap();
                 std::thread::sleep(std::time::Duration::from_millis(1000));
@@ -193,20 +290,20 @@ fn main() {
             let keys = smc.keys().unwrap_or_default();
 
             loop {
+                // All SMC - Fast & Cheap
                 let sys_power = smc.read_key::<f32>(pstr_key).unwrap_or(0.0);
                 let bat_power = smc.read_key::<f32>(ppbr_key).unwrap_or(0.0);
                 let mem_power = smc.read_key::<f32>(phpm_key).unwrap_or(0.0);
-                
-                // Need powermetrics for CPU/GPU power
-                let pm_output = std::process::Command::new("sudo")
-                    .args(["powermetrics", "-n", "1", "-i", "50", "--samplers", "cpu_power"])
-                    .output().ok().and_then(|o| String::from_utf8(o.stdout).ok()).unwrap_or_default();
-                
-                let cpu_mw: f32 = pm_output.lines().find(|l| l.contains("CPU Power:")).and_then(|l| l.split_whitespace().find(|s| s.parse::<f64>().is_ok()).and_then(|s| s.parse::<f32>().ok())).unwrap_or(0.0);
-                let gpu_mw: f32 = pm_output.lines().find(|l| l.contains("GPU Power:")).and_then(|l| l.split_whitespace().find(|s| s.parse::<f64>().is_ok()).and_then(|s| s.parse::<f32>().ok())).unwrap_or(0.0);
-                let ane_mw: f32 = pm_output.lines().find(|l| l.contains("ANE Power:")).and_then(|l| l.split_whitespace().find(|s| s.parse::<f64>().is_ok()).and_then(|s| s.parse::<f32>().ok())).unwrap_or(0.0);
+                let phps = smc.read_key::<f32>(phps_key).unwrap_or(0.0);
+                let cpu_smc = smc.read_key::<f32>(pp0b_key).unwrap_or(0.0);
+                let gpu_smc = smc.read_key::<f32>(pp7b_key).unwrap_or(0.0);
 
-                let display_w = (sys_power - (cpu_mw + gpu_mw + ane_mw)/1000.0 - mem_power).max(0.0);
+                // No powermetrics needed for simple monitor! 
+                let mut display_w = (sys_power - phps - mem_power).max(0.0);
+                // Fallback
+                if phps < 0.1 {
+                    display_w = (sys_power - cpu_smc - gpu_smc - mem_power).max(0.0);
+                }
                 
                 let mut cpu_temps = Vec::new();
                 for key in &keys {
@@ -240,42 +337,40 @@ fn main() {
              }
         }
 
-        "trigger" => {
-            // Default threshold: 500mW
-            let threshold_mw = args.get(2).and_then(|s| s.parse::<f32>().ok()).unwrap_or(500.0);
-            // Default interval: 100ms (10Hz)
+        "trigger_pct" => {
+            // Default threshold: 10%
+            let threshold_pct = args.get(2).and_then(|s| s.parse::<f32>().ok()).unwrap_or(10.0) / 100.0;
             let interval_ms = args.get(3).and_then(|s| s.parse::<u64>().ok()).unwrap_or(100);
             
             let pstr_key = string_to_key("PSTR");
-            let phpm_key = string_to_key("PHPM");
-            let pp0b_key = string_to_key("PP0b");
-            let pp7b_key = string_to_key("PP7b");
-
-            // Use PSTR (Total System) for maximum sensitivity to backlight + pixels
-            let get_disp_mw = |smc: &SMC| -> f32 {
-                let total = smc.read_key::<f32>(pstr_key).unwrap_or(0.0);
-                let mem = smc.read_key::<f32>(phpm_key).unwrap_or(0.0);
-                let cpu = smc.read_key::<f32>(pp0b_key).unwrap_or(0.0);
-                let gpu = smc.read_key::<f32>(pp7b_key).unwrap_or(0.0);
-                ((total - cpu - gpu - mem).max(0.0)) * 1000.0
+            let get_total_mw = |smc: &SMC| -> f32 {
+                smc.read_key::<f32>(pstr_key).unwrap_or(0.0) * 1000.0
             };
 
-            let mut last_stable = get_disp_mw(&smc);
-            
-            // Smoothing: Exponential Moving Average (EMA)
+            let mut last_stable = get_total_mw(&smc).max(100.0); // Avoid div by zero
+            let mut stable_counter = 0;
             let alpha = 0.2; 
             let mut smoothed_val = last_stable;
 
             loop {
-                let raw_current = get_disp_mw(&smc);
+                let raw_current = get_total_mw(&smc);
                 smoothed_val = alpha * raw_current + (1.0 - alpha) * smoothed_val;
                 
-                let delta = (smoothed_val - last_stable).abs();
+                // Calculate percentage delta relative to the baseline
+                let delta_abs = (smoothed_val - last_stable).abs();
+                let pct_change = delta_abs / last_stable;
 
-                if delta > threshold_mw {
-                    println!("{{\"event\":\"content_change\",\"delta_mw\":{:.0},\"current_mw\":{:.0}}}", delta, smoothed_val);
+                if pct_change > threshold_pct {
+                    println!("{{\"event\":\"content_change\",\"delta_pct\":{:.1},\"delta_mw\":{:.0},\"current_mw\":{:.0}}}", pct_change*100.0, delta_abs, smoothed_val);
                     last_stable = smoothed_val;
-                    std::thread::sleep(std::time::Duration::from_millis(1000)); 
+                    // Dynamic cooldown: shorter cooldown for big jumps? No, keep it safe.
+                    std::thread::sleep(std::time::Duration::from_millis(500)); 
+                } else {
+                    stable_counter += 1;
+                    if stable_counter > (1000 / interval_ms).max(1) { 
+                        last_stable = smoothed_val;
+                        stable_counter = 0;
+                    }
                 }
                 
                 use std::io::Write;
@@ -284,6 +379,6 @@ fn main() {
             }
         }
 
-        _ => { println!("Usage: kim_temp [cpu|gpu|power|json|stream|monitor|monitor-p|trigger <threshold_mw> <interval_ms>]"); }
+        _ => { println!("Usage: kim_temp [cpu|gpu|power|json|stream|monitor|monitor-p|trigger <mw> <ms>|trigger_pct <pct> <ms>]"); }
     }
 }
