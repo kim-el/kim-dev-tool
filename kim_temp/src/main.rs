@@ -242,8 +242,12 @@ fn main() {
                         .output().ok().and_then(|o| String::from_utf8(o.stdout).ok()).unwrap_or_default();
                     
                     // We still parse these for the JSON output, but we don't rely on them for the fast-loop math anymore
-                    cached_cpu_mw = pm_output.lines().find(|l| l.contains("CPU Power:")).and_then(|l| l.split_whitespace().find(|s| s.parse::<f64>().is_ok()).and_then(|s| s.parse::<f64>().ok())).map(|v| v as i32).unwrap_or(0);
-                    cached_gpu_mw = pm_output.lines().find(|l| l.contains("GPU Power:")).and_then(|l| l.split_whitespace().find(|s| s.parse::<f64>().is_ok()).and_then(|s| s.parse::<f64>().ok())).map(|v| v as i32).unwrap_or(0);
+                    // cached_cpu_mw = pm_output.lines().find(|l| l.contains("CPU Power:"))... // Old way
+                    // cached_gpu_mw = pm_output.lines().find(|l| l.contains("GPU Power:"))... // Old way
+                    
+                    // Use SMC calibration for consistent reporting
+                    cached_cpu_mw = (smc.read_key::<f32>(pp0b_key).unwrap_or(0.0) * 1000.0) as i32;
+                    cached_gpu_mw = (smc.read_key::<f32>(pp7b_key).unwrap_or(0.0) * 1000.0) as i32;
                     cached_ane_mw = pm_output.lines().find(|l| l.contains("ANE Power:")).and_then(|l| l.split_whitespace().find(|s| s.parse::<f64>().is_ok()).and_then(|s| s.parse::<f64>().ok())).map(|v| v as i32).unwrap_or(0);
 
                     let mut total_wakeups: f64 = 0.0;
