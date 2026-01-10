@@ -18,75 +18,6 @@ fn string_to_key(s: &str) -> four_char_code::FourCharCode {
     four_char_code::FourCharCode(val)
 }
 
-fn calibrate_cpu_gpu_keys(smc: &SMC) -> Option<(four_char_code::FourCharCode, four_char_code::FourCharCode)> {
-    // 1. Run powermetrics once to get the "official" ground truth
-    let output = std::process::Command::new("sudo")
-        .args(["powermetrics", "-n", "1", "-i", "100", "--samplers", "cpu_power"])
-        .output()
-        .ok()?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    let pm_cpu_mw = stdout.lines()
-        .find(|l| l.contains("CPU Power:"))
-        .and_then(|l| l.split_whitespace().find(|s| s.parse::<f64>().is_ok()))
-        .and_then(|s| s.parse::<f64>().ok())
-        .unwrap_or(0.0) as f32;
-
-    let pm_gpu_mw = stdout.lines()
-        .find(|l| l.contains("GPU Power:"))
-        .and_then(|l| l.split_whitespace().find(|s| s.parse::<f64>().is_ok()))
-        .and_then(|s| s.parse::<f64>().ok())
-        .unwrap_or(0.0) as f32;
-
-    // 2. Scan all P-keys
-    let keys = smc.keys().unwrap_or_default();
-    let mut best_cpu_key = four_char_code::FourCharCode(0);
-    let mut best_gpu_key = four_char_code::FourCharCode(0);
-    let mut best_cpu_diff = f32::MAX;
-    let mut best_gpu_diff = f32::MAX;
-
-    // Threshold: Match must be within 30% or 100mW (loose match to account for timing jitter)
-    for key in keys {
-        let name = key_to_string(key);
-        if name.starts_with('P') {
-            if let Ok(val) = smc.read_key::<f32>(key) {
-                let smc_mw = val * 1000.0;
-                
-                // CPU Candidate
-                let cpu_diff = (smc_mw - pm_cpu_mw).abs();
-                if cpu_diff < best_cpu_diff {
-                    best_cpu_diff = cpu_diff;
-                    best_cpu_key = key;
-                }
-
-                // GPU Candidate
-                let gpu_diff = (smc_mw - pm_gpu_mw).abs();
-                if gpu_diff < best_gpu_diff {
-                    best_gpu_diff = gpu_diff;
-                    best_gpu_key = key;
-                }
-            }
-        }
-    }
-
-    // Heuristics: If the "best match" is still way off (> 500mW and > 50%), reject it.
-    // For idle GPU, differences are small (e.g. 5mW vs 20mW), so we allow small absolute diffs.
-    
-    let cpu_valid = best_cpu_diff < 500.0 || best_cpu_diff < pm_cpu_mw * 0.5;
-    let gpu_valid = best_gpu_diff < 500.0 || best_gpu_diff < pm_gpu_mw * 0.5;
-
-    if cpu_valid && gpu_valid {
-        eprintln!("[Calibrated] CPU: {} ({:.0}mW), GPU: {} ({:.0}mW)", 
-            key_to_string(best_cpu_key), smc.read_key::<f32>(best_cpu_key).unwrap_or(0.0)*1000.0,
-            key_to_string(best_gpu_key), smc.read_key::<f32>(best_gpu_key).unwrap_or(0.0)*1000.0);
-        Some((best_cpu_key, best_gpu_key))
-    } else {
-        // Fallback to standard M1 keys if calibration is wildly failing
-        // eprintln!("Calibration failed or inconclusive. Using defaults.");
-        None
-    }
-}
-
 fn main() {
     let args: Vec<String> = env::args().collect();
     let mode = args.get(1).map(|s| s.as_str()).unwrap_or("cpu");
@@ -107,8 +38,13 @@ fn main() {
     let _phps_key = string_to_key("PHPS"); // Package Total (SoC + some extras)
     let phpm_key = string_to_key("PHPM"); // Memory
     
-    // Dynamic Calibration for CPU/GPU keys (M1 vs M2 vs M3 vs M4 compatibility)
-    let (pp0b_key, pp7b_key) = calibrate_cpu_gpu_keys(&smc).unwrap_or((string_to_key("PP0b"), string_to_key("PP7b")));
+    // Hardcoded Keys (M4 Verified)
+    // CPU: PP0b (Main CPU Rail)
+    // GPU: PP1b (Main GPU Rail)
+    // ANE: PP7b (Neural Engine - verified via Vision stress test)
+    let pp0b_key = string_to_key("PP0b");
+    let pp1b_key = string_to_key("PP1b");
+    let pp7b_key = string_to_key("PP7b");
 
     match mode {
         "cpu" => {
@@ -180,9 +116,6 @@ fn main() {
             let mut cached_charging = false;
             let mut cached_mem_free_pct = 0;
             let mut cached_efficiency = 0.0;
-            let mut cached_cpu_mw = 0;
-            let mut cached_gpu_mw = 0;
-            let mut cached_ane_mw = 0;
             let mut cached_total_wakeups = 0.0;
             let mut cached_top_json = String::from("[]");
             let mut cached_high_wakeups_json = String::from("[]");
@@ -195,11 +128,12 @@ fn main() {
                 let bat_power = smc.read_key::<f32>(ppbr_key).unwrap_or(0.0);
                 let mem_power = smc.read_key::<f32>(phpm_key).unwrap_or(0.0);
                 let cpu_smc = smc.read_key::<f32>(pp0b_key).unwrap_or(0.0);
-                let gpu_smc = smc.read_key::<f32>(pp7b_key).unwrap_or(0.0);
+                let gpu_smc = smc.read_key::<f32>(pp1b_key).unwrap_or(0.0);
+                let ane_smc = smc.read_key::<f32>(pp7b_key).unwrap_or(0.0);
                 
                 // Unified Silicon-Only Subtraction Formula
                 // Most accurate for M4 as it avoids the ambiguous PHPS rail.
-                let display_w = (sys_power - cpu_smc - gpu_smc - mem_power).max(0.0);
+                let display_w = (sys_power - cpu_smc - gpu_smc - ane_smc - mem_power).max(0.0);
 
                 let mut cpu_temps = Vec::new(); let mut gpu_temps = Vec::new(); let mut mem_temps = Vec::new(); let mut ssd_temps = Vec::new(); let mut bat_temps = Vec::new();
                 for key in &keys {
@@ -243,15 +177,6 @@ fn main() {
                         .args(["powermetrics", "-n", "1", "-i", "100", "--samplers", "cpu_power,tasks"])
                         .output().ok().and_then(|o| String::from_utf8(o.stdout).ok()).unwrap_or_default();
                     
-                    // We still parse these for the JSON output, but we don't rely on them for the fast-loop math anymore
-                    // cached_cpu_mw = pm_output.lines().find(|l| l.contains("CPU Power:"))... // Old way
-                    // cached_gpu_mw = pm_output.lines().find(|l| l.contains("GPU Power:"))... // Old way
-                    
-                    // Use SMC calibration for consistent reporting
-                    cached_cpu_mw = (smc.read_key::<f32>(pp0b_key).unwrap_or(0.0) * 1000.0) as i32;
-                    cached_gpu_mw = (smc.read_key::<f32>(pp7b_key).unwrap_or(0.0) * 1000.0) as i32;
-                    cached_ane_mw = pm_output.lines().find(|l| l.contains("ANE Power:")).and_then(|l| l.split_whitespace().find(|s| s.parse::<f64>().is_ok()).and_then(|s| s.parse::<f64>().ok())).map(|v| v as i32).unwrap_or(0);
-
                     let mut total_wakeups: f64 = 0.0;
                     let mut processes: Vec<(String, f64, f64)> = Vec::new();
                     let mut in_tasks = false;
@@ -278,7 +203,7 @@ fn main() {
                 }
 
                 println!("{{\"cpu_temp\":{:.1},\"gpu_temp\":{:.1},\"mem_temp\":{:.1},\"ssd_temp\":{:.1},\"bat_temp\":{:.1},\"power_w\":{:.2},\"bat_power_w\":{:.2},\"mem_power_w\":{:.2},\"display_w\":{:.2},\"cpu_mw\":{},\"gpu_mw\":{},\"ane_mw\":{},\"battery_pct\":{},\"charging\":{},\"cycle_count\":{},\"health_pct\":{},\"mem_free_pct\":{},\"efficiency_hrs\":{:.1},\"wakeups_per_sec\":{:.0},\"top_cpu\":[{}],\"high_wakeups\":[{}]}}",
-                    cpu_avg, gpu_avg, mem_avg, ssd_avg, bat_avg, sys_power, bat_power, mem_power, display_w, cached_cpu_mw, cached_gpu_mw, cached_ane_mw, cached_battery_pct, cached_charging, cycle_count, health_pct, cached_mem_free_pct, cached_efficiency, cached_total_wakeups, cached_top_json, cached_high_wakeups_json);
+                    cpu_avg, gpu_avg, mem_avg, ssd_avg, bat_avg, sys_power, bat_power, mem_power, display_w, (cpu_smc * 1000.0) as i32, (gpu_smc * 1000.0) as i32, (ane_smc * 1000.0) as i32, cached_battery_pct, cached_charging, cycle_count, health_pct, cached_mem_free_pct, cached_efficiency, cached_total_wakeups, cached_top_json, cached_high_wakeups_json);
                 
                 if mode == "json" { break; }
                 

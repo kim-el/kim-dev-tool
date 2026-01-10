@@ -15,9 +15,18 @@ fn wait_for_enter(prompt: &str) {
     io::stdin().read_line(&mut input).unwrap();
 }
 
+fn string_to_key(s: &str) -> four_char_code::FourCharCode {
+    let bytes = s.as_bytes();
+    let val = ((bytes[0] as u32) << 24) 
+            | ((bytes[1] as u32) << 16) 
+            | ((bytes[2] as u32) << 8) 
+            | (bytes[3] as u32);
+    four_char_code::FourCharCode(val)
+}
+
 fn get_display_power(smc: &SMC, pp0b: four_char_code::FourCharCode, pp7b: four_char_code::FourCharCode) -> f32 {
-    let pstr = smc.read_key::<f32>(four_char_code::FourCharCode(*b"PSTR")).unwrap_or(0.0);
-    let mem  = smc.read_key::<f32>(four_char_code::FourCharCode(*b"PHPM")).unwrap_or(0.0);
+    let pstr = smc.read_key::<f32>(string_to_key("PSTR")).unwrap_or(0.0);
+    let mem  = smc.read_key::<f32>(string_to_key("PHPM")).unwrap_or(0.0);
     // Use user-provided calibrated keys if possible, otherwise defaults
     let cpu = smc.read_key::<f32>(pp0b).unwrap_or(0.0);
     let gpu = smc.read_key::<f32>(pp7b).unwrap_or(0.0);
@@ -61,8 +70,8 @@ fn main() {
     // Ideally we re-run calibration logic here, but for simplicity let's ask the user or assume PZD1/PP2b for this specific session.
     // Actually, let's use the ones we saw in the logs: CPU=PZD1, GPU=PP2b (approx).
     // Better: Scan for PZD1.
-    let pp0b = four_char_code::FourCharCode(*b"PZD1");
-    let pp7b = four_char_code::FourCharCode(*b"PP2b");
+    let pp0b = string_to_key("PZD1");
+    let pp7b = string_to_key("PP2b");
 
     println!("--- Content Brightness Calibrator (M4) ---");
     println!("Using Power Keys -> CPU: PZD1, GPU: PP2b");
