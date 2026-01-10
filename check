@@ -11,10 +11,14 @@ case "$1" in
     delta)
         "$SCRIPT_DIR/kim_temp_bin" json
         ;;
+    signal)
+        "$SCRIPT_DIR/kim_temp_bin" json-fast
+        ;;
     *)
-        echo "Usage: check {temp|delta}"
-        echo "  temp  - Run the human-readable monitor dashboard"
-        echo "  delta - Run the LLM-readable JSON snapshot"
+        echo "Usage: check {temp|delta|signal}"
+        echo "  temp   - Run the human-readable monitor dashboard"
+        echo "  delta  - Run the LLM-readable JSON snapshot"
+        echo "  signal - Run the high-speed JSON signal (no powermetrics)"
         exit 1
         ;;
 esac

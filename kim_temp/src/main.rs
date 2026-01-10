@@ -96,25 +96,32 @@ fn main() {
             } else { println!("N/A"); }
         }
         
-        "json" | "stream" => {
-            let ioreg_batt = std::process::Command::new("ioreg").args(["-r", "-c", "AppleSmartBattery"]).output().ok().and_then(|o| String::from_utf8(o.stdout).ok()).unwrap_or_default();
-            let design_mah: f32 = ioreg_batt.lines().find(|l| l.contains("\"DesignCapacity\"") && l.contains('=')).and_then(|l| l.split('=').nth(1).and_then(|s| s.trim().parse().ok())).unwrap_or(4500.0);
-            let nominal_mah: f32 = ioreg_batt.lines().find(|l| l.contains("\"NominalChargeCapacity\"") && l.contains('=')).and_then(|l| l.split('=').nth(1).and_then(|s| s.trim().parse().ok())).unwrap_or(design_mah);
+        "json" | "stream" | "json-fast" => {
+            let is_fast = mode == "json-fast";
             
-            // Fix: Find the exact "CycleCount" = line, ignoring the "BatteryData" blob
-            let cycle_count: i32 = ioreg_batt.lines()
-                .find(|l| l.trim().starts_with("\"CycleCount\" ="))
-                .and_then(|l| l.split('=').nth(1).and_then(|s| s.trim().parse().ok()))
-                .unwrap_or(0);
+            let mut design_mah = 4500.0;
+            let mut nominal_mah = 4500.0;
+            let mut cycle_count = 0;
+            let mut health_pct = 100;
+            let mut total_bytes: u64 = 16 * 1024 * 1024 * 1024;
+            let mut page_size = 16384;
+
+            if !is_fast {
+                let ioreg_batt = std::process::Command::new("ioreg").args(["-r", "-c", "AppleSmartBattery"]).output().ok().and_then(|o| String::from_utf8(o.stdout).ok()).unwrap_or_default();
+                design_mah = ioreg_batt.lines().find(|l| l.contains("\"DesignCapacity\"") && l.contains('=')).and_then(|l| l.split('=').nth(1).and_then(|s| s.trim().parse().ok())).unwrap_or(4500.0);
+                nominal_mah = ioreg_batt.lines().find(|l| l.contains("\"NominalChargeCapacity\"") && l.contains('=')).and_then(|l| l.split('=').nth(1).and_then(|s| s.trim().parse().ok())).unwrap_or(design_mah);
                 
-            let health_pct: i32 = ((nominal_mah / design_mah) * 100.0) as i32;
+                cycle_count = ioreg_batt.lines()
+                    .find(|l| l.trim().starts_with("\"CycleCount\" ="))
+                    .and_then(|l| l.split('=').nth(1).and_then(|s| s.trim().parse().ok()))
+                    .unwrap_or(0);
+                    
+                health_pct = ((nominal_mah / design_mah) * 100.0) as i32;
+                total_bytes = std::process::Command::new("sysctl").args(["-n", "hw.memsize"]).output().ok().and_then(|o| String::from_utf8(o.stdout).ok()).and_then(|s| s.trim().parse().ok()).unwrap_or(16u64 * 1024 * 1024 * 1024);
+                page_size = std::process::Command::new("pagesize").output().ok().and_then(|o| String::from_utf8(o.stdout).ok()).and_then(|s| s.trim().parse().ok()).unwrap_or(16384);
+            }
 
-            let battery_mah = nominal_mah;
-            let battery_wh = battery_mah * 11.4 / 1000.0;
-            
-            let total_bytes: u64 = std::process::Command::new("sysctl").args(["-n", "hw.memsize"]).output().ok().and_then(|o| String::from_utf8(o.stdout).ok()).and_then(|s| s.trim().parse().ok()).unwrap_or(16 * 1024 * 1024 * 1024);
-            let page_size: u64 = std::process::Command::new("pagesize").output().ok().and_then(|o| String::from_utf8(o.stdout).ok()).and_then(|s| s.trim().parse().ok()).unwrap_or(16384);
-
+            let battery_wh = nominal_mah * 11.4 / 1000.0;
             let keys = smc.keys().unwrap_or_default();
             
             // Cache variables for slow-update data
@@ -141,32 +148,33 @@ fn main() {
                 let bt_smc = smc.read_key::<f32>(bt_key).unwrap_or(0.0);
                 
                 // Unified Silicon-Only Subtraction Formula
-                // Most accurate for M4 as it avoids the ambiguous PHPS rail.
                 let display_w = (sys_power - cpu_smc - gpu_smc - ane_smc - wifi_smc - ssd_smc - bt_smc - mem_power).max(0.0);
 
-                let mut cpu_temps = Vec::new(); let mut gpu_temps = Vec::new(); let mut mem_temps = Vec::new(); let mut ssd_temps = Vec::new(); let mut bat_temps = Vec::new();
-                for key in &keys {
-                    let ks = key_to_string(*key);
-                    if let Ok(t) = smc.temperature(*key) {
-                        if t > 0.0 && t < 150.0 {
-                            if ks.starts_with("Tp") || ks.starts_with("Te") || ks.starts_with("Tc") { cpu_temps.push(t); }
-                            else if ks.starts_with("Tg") { gpu_temps.push(t); }
-                            else if ks.starts_with("TM") { mem_temps.push(t); }
-                            else if ks.starts_with("TS") { ssd_temps.push(t); }
-                            else if ks.starts_with("TB") { bat_temps.push(t); }
+                let mut cpu_temp = 0.0; let mut gpu_temp = 0.0; let mut mem_temp = 0.0; let mut ssd_temp = 0.0; let mut bat_temp = 0.0;
+                
+                if !is_fast || loop_count == 0 {
+                    let mut cpu_temps = Vec::new(); let mut gpu_temps = Vec::new(); let mut mem_temps = Vec::new(); let mut ssd_temps = Vec::new(); let mut bat_temps = Vec::new();
+                    for key in &keys {
+                        let ks = key_to_string(*key);
+                        if let Ok(t) = smc.temperature(*key) {
+                            if t > 0.0 && t < 150.0 {
+                                if ks.starts_with("Tp") || ks.starts_with("Te") || ks.starts_with("Tc") { cpu_temps.push(t); }
+                                else if ks.starts_with("Tg") { gpu_temps.push(t); }
+                                else if ks.starts_with("TM") { mem_temps.push(t); }
+                                else if ks.starts_with("TS") { ssd_temps.push(t); }
+                                else if ks.starts_with("TB") { bat_temps.push(t); }
+                            }
                         }
                     }
+                    cpu_temp = if cpu_temps.is_empty() { 0.0 } else { cpu_temps.iter().sum::<f64>() / cpu_temps.len() as f64 };
+                    gpu_temp = if gpu_temps.is_empty() { 0.0 } else { gpu_temps.iter().sum::<f64>() / gpu_temps.len() as f64 };
+                    mem_temp = if mem_temps.is_empty() { 0.0 } else { mem_temps.iter().sum::<f64>() / mem_temps.len() as f64 };
+                    ssd_temp = if ssd_temps.is_empty() { 0.0 } else { ssd_temps.iter().sum::<f64>() / ssd_temps.len() as f64 };
+                    bat_temp = if bat_temps.is_empty() { 0.0 } else { bat_temps.iter().sum::<f64>() / bat_temps.len() as f64 };
                 }
-                
-                let cpu_avg = if cpu_temps.is_empty() { 0.0 } else { cpu_temps.iter().sum::<f64>() / cpu_temps.len() as f64 };
-                let gpu_avg = if gpu_temps.is_empty() { 0.0 } else { gpu_temps.iter().sum::<f64>() / gpu_temps.len() as f64 };
-                let mem_avg = if mem_temps.is_empty() { 0.0 } else { mem_temps.iter().sum::<f64>() / mem_temps.len() as f64 };
-                let ssd_avg = if ssd_temps.is_empty() { 0.0 } else { ssd_temps.iter().sum::<f64>() / ssd_temps.len() as f64 };
-                let bat_avg = if bat_temps.is_empty() { 0.0 } else { bat_temps.iter().sum::<f64>() / bat_temps.len() as f64 };
 
                 // --- SLOW PATH (Subprocesses) ---
-                // Run every 5 iterations (approx every 5s) or on first run
-                if loop_count % 5 == 0 {
+                if !is_fast && loop_count % 5 == 0 {
                     let battery_output = std::process::Command::new("pmset").args(["-g", "batt"]).output().ok().and_then(|o| String::from_utf8(o.stdout).ok()).unwrap_or_default();
                     cached_battery_pct = battery_output.split('%').next().and_then(|s| s.split_whitespace().last()).and_then(|s| s.parse().ok()).unwrap_or(0);
                     cached_charging = battery_output.contains("; charging;") || (battery_output.contains("AC Power") && !battery_output.contains("discharging"));
@@ -211,10 +219,15 @@ fn main() {
                     cached_high_wakeups_json = processes.iter().filter(|(_,_,w)| *w > 50.0).take(5).map(|(n,c,w)| format!("{{\"name\":\"{}\",\"cpu_ms\":{:.1},\"wakeups\":{:.1}}}", n, c, w)).collect::<Vec<_>>().join(",");
                 }
 
-                println!("{{\"cpu_temp\":{:.1},\"gpu_temp\":{:.1},\"mem_temp\":{:.1},\"ssd_temp\":{:.1},\"bat_temp\":{:.1},\"power_w\":{:.2},\"bat_power_w\":{:.2},\"mem_power_w\":{:.2},\"display_w\":{:.2},\"cpu_mw\":{},\"gpu_mw\":{},\"ane_mw\":{},\"wifi_mw\":{},\"ssd_mw\":{},\"bt_mw\":{},\"battery_pct\":{},\"charging\":{},\"cycle_count\":{},\"health_pct\":{},\"mem_free_pct\":{},\"efficiency_hrs\":{:.1},\"wakeups_per_sec\":{:.0},\"top_cpu\":[{}],\"high_wakeups\":[{}]}}",
-                    cpu_avg, gpu_avg, mem_avg, ssd_avg, bat_avg, sys_power, bat_power, mem_power, display_w, (cpu_smc * 1000.0) as i32, (gpu_smc * 1000.0) as i32, (ane_smc * 1000.0) as i32, (wifi_smc * 1000.0) as i32, (ssd_smc * 1000.0) as i32, (bt_smc * 1000.0) as i32, cached_battery_pct, cached_charging, cycle_count, health_pct, cached_mem_free_pct, cached_efficiency, cached_total_wakeups, cached_top_json, cached_high_wakeups_json);
+                if is_fast {
+                    println!("{{\"display_w\":{:.3},\"sys_w\":{:.3},\"cpu_mw\":{},\"gpu_mw\":{},\"ane_mw\":{},\"wifi_mw\":{},\"ssd_mw\":{},\"bt_mw\":{},\"mem_mw\":{}}}",
+                        display_w, sys_power, (cpu_smc * 1000.0) as i32, (gpu_smc * 1000.0) as i32, (ane_smc * 1000.0) as i32, (wifi_smc * 1000.0) as i32, (ssd_smc * 1000.0) as i32, (bt_smc * 1000.0) as i32, (mem_power * 1000.0) as i32);
+                } else {
+                    println!("{{\"cpu_temp\":{:.1},\"gpu_temp\":{:.1},\"mem_temp\":{:.1},\"ssd_temp\":{:.1},\"bat_temp\":{:.1},\"power_w\":{:.2},\"bat_power_w\":{:.2},\"mem_power_w\":{:.2},\"display_w\":{:.2},\"cpu_mw\":{},\"gpu_mw\":{},\"ane_mw\":{},\"wifi_mw\":{},\"ssd_mw\":{},\"bt_mw\":{},\"battery_pct\":{},\"charging\":{},\"cycle_count\":{},\"health_pct\":{},\"mem_free_pct\":{},\"efficiency_hrs\":{:.1},\"wakeups_per_sec\":{:.0},\"top_cpu\":[{}],\"high_wakeups\":[{}]}}",
+                        cpu_temp, gpu_temp, mem_temp, ssd_temp, bat_temp, sys_power, bat_power, mem_power, display_w, (cpu_smc * 1000.0) as i32, (gpu_smc * 1000.0) as i32, (ane_smc * 1000.0) as i32, (wifi_smc * 1000.0) as i32, (ssd_smc * 1000.0) as i32, (bt_smc * 1000.0) as i32, cached_battery_pct, cached_charging, cycle_count, health_pct, cached_mem_free_pct, cached_efficiency, cached_total_wakeups, cached_top_json, cached_high_wakeups_json);
+                }
                 
-                if mode == "json" { break; }
+                if mode == "json" || mode == "json-fast" { break; }
                 
                 loop_count += 1;
                 use std::io::Write;
