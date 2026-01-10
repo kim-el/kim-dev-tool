@@ -9,14 +9,25 @@ fn key_to_string(key: four_char_code::FourCharCode) -> String {
 fn main() {
     let smc = SMC::new().expect("SMC init failed");
     let keys = smc.keys().unwrap_or_default();
-    let p_keys: Vec<_> = keys.iter().filter(|k| key_to_string(**k).starts_with('P')).collect();
+    
+    // Filter for "I" (Current) keys related to Backlight/Display
+    // IB = Current Battery/Backlight? ID = Current DC?
+    let candidates: Vec<_> = keys.iter().filter(|k| {
+        let s = key_to_string(**k);
+        // "IB" often means Current Battery or Backlight
+        // "ID" often means Current DC-In
+        // "VP" often means Voltage Power
+        s.starts_with("IB") || s.starts_with("VP") || s.starts_with("VD")
+    }).collect();
 
-    println!("Scanning 52 P-keys for SSD Activity...");
-    println!("1. Establishing Baseline (Wait for 'GO'...)...");
+    println!("Scanning {} Candidate Keys (IB/VP/VD)...", candidates.len());
+    println!("1. Establishing Baseline (Set Brightness to 0%)...");
 
     let mut baseline = std::collections::HashMap::new();
+    
     for _ in 0..10 {
-        for key in &p_keys {
+        for key in &candidates {
+            // Attempt to read as f32 (most common for sensors)
             if let Ok(val) = smc.read_key::<f32>(**key) {
                 *baseline.entry(*key).or_insert(0.0) += val;
             }
@@ -25,26 +36,27 @@ fn main() {
     }
     for val in baseline.values_mut() { *val /= 10.0; }
 
-    println!("Baseline Set. GO!");
+    println!("Baseline Set. Please SET BRIGHTNESS TO 100%!");
+    println!("Scanning (60 samples)... \n");
 
     for i in 1..=60 {
         let mut movers = Vec::new();
-        for key in &p_keys {
+        for key in &candidates {
             if let Ok(val) = smc.read_key::<f32>(**key) {
                 let base = *baseline.get(key).unwrap_or(&0.0);
-                let delta = (val - base) * 1000.0;
-                if delta.abs() > 100.0 {
+                let delta = val - base;
+
+                if delta.abs() > 0.1 {
                     movers.push((key_to_string(**key), delta));
                 }
             }
         }
         
-        movers.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
         if !movers.is_empty() {
-            print!("\n[{:3}] ", i);
-            for (name, delta) in movers.iter().take(5) {
-                print!("{} ({:+.0}mW) ", name, delta);
+            movers.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            print!("\n[{:2}] ", i);
+            for (name, d) in movers.iter().take(4) {
+                print!("{} {:+.2} | ", name, d);
             }
         } else {
             print!(".");

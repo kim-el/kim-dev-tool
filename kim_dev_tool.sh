@@ -72,6 +72,7 @@ sudo "$script_dir/kim_temp_bin" stream | while IFS= read -r line; do
     ane_mw=$(echo "$line" | jq -r '.ane_mw')
     wifi_mw=$(echo "$line" | jq -r '.wifi_mw // 0')
     ssd_mw=$(echo "$line" | jq -r '.ssd_mw // 0')
+    bt_mw=$(echo "$line" | jq -r '.bt_mw // 0')
     
     battery_pct=$(echo "$line" | jq -r '.battery_pct')
     charging=$(echo "$line" | jq -r '.charging')
@@ -151,6 +152,7 @@ sudo "$script_dir/kim_temp_bin" stream | while IFS= read -r line; do
     printf "\033[1m   System Power:\033[0m\033[K\n"
     printf "   ├─ WiFi:    %5d mW\033[K\n" "$wifi_mw"
     printf "   ├─ SSD:     %5d mW\033[K\n" "$ssd_mw"
+    printf "   ├─ BT/Logic:%5d mW\033[K\n" "$bt_mw"
     printf "   ├─ Memory:  %5d mW\033[K\n" "$misc_mw"
     printf "   └─ Disp+Sys:%5d mW   (Screen + Fans + Idle)\033[K\n" "$screen_mw"
     
