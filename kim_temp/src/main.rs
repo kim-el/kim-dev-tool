@@ -39,12 +39,16 @@ fn main() {
     let phpm_key = string_to_key("PHPM"); // Memory
     
     // Hardcoded Keys (M4 Verified)
-    // CPU: PP0b (Main CPU Rail)
-    // GPU: PP1b (Main GPU Rail)
-    // ANE: PP7b (Neural Engine - verified via Vision stress test)
+    // CPU: PP0b
+    // GPU: PP1b
+    // ANE: PP7b
+    // WiFi: PMVC
+    // SSD: PZC1 (Verified via 5GB dd test)
     let pp0b_key = string_to_key("PP0b");
     let pp1b_key = string_to_key("PP1b");
     let pp7b_key = string_to_key("PP7b");
+    let wifi_key = string_to_key("PMVC");
+    let ssd_key  = string_to_key("PZC1");
 
     match mode {
         "cpu" => {
@@ -130,10 +134,11 @@ fn main() {
                 let cpu_smc = smc.read_key::<f32>(pp0b_key).unwrap_or(0.0);
                 let gpu_smc = smc.read_key::<f32>(pp1b_key).unwrap_or(0.0);
                 let ane_smc = smc.read_key::<f32>(pp7b_key).unwrap_or(0.0);
+                let wifi_smc = smc.read_key::<f32>(wifi_key).unwrap_or(0.0);
                 
                 // Unified Silicon-Only Subtraction Formula
                 // Most accurate for M4 as it avoids the ambiguous PHPS rail.
-                let display_w = (sys_power - cpu_smc - gpu_smc - ane_smc - mem_power).max(0.0);
+                let display_w = (sys_power - cpu_smc - gpu_smc - ane_smc - wifi_smc - mem_power).max(0.0);
 
                 let mut cpu_temps = Vec::new(); let mut gpu_temps = Vec::new(); let mut mem_temps = Vec::new(); let mut ssd_temps = Vec::new(); let mut bat_temps = Vec::new();
                 for key in &keys {
@@ -202,8 +207,8 @@ fn main() {
                     cached_high_wakeups_json = processes.iter().filter(|(_,_,w)| *w > 50.0).take(5).map(|(n,c,w)| format!("{{\"name\":\"{}\",\"cpu_ms\":{:.1},\"wakeups\":{:.1}}}", n, c, w)).collect::<Vec<_>>().join(",");
                 }
 
-                println!("{{\"cpu_temp\":{:.1},\"gpu_temp\":{:.1},\"mem_temp\":{:.1},\"ssd_temp\":{:.1},\"bat_temp\":{:.1},\"power_w\":{:.2},\"bat_power_w\":{:.2},\"mem_power_w\":{:.2},\"display_w\":{:.2},\"cpu_mw\":{},\"gpu_mw\":{},\"ane_mw\":{},\"battery_pct\":{},\"charging\":{},\"cycle_count\":{},\"health_pct\":{},\"mem_free_pct\":{},\"efficiency_hrs\":{:.1},\"wakeups_per_sec\":{:.0},\"top_cpu\":[{}],\"high_wakeups\":[{}]}}",
-                    cpu_avg, gpu_avg, mem_avg, ssd_avg, bat_avg, sys_power, bat_power, mem_power, display_w, (cpu_smc * 1000.0) as i32, (gpu_smc * 1000.0) as i32, (ane_smc * 1000.0) as i32, cached_battery_pct, cached_charging, cycle_count, health_pct, cached_mem_free_pct, cached_efficiency, cached_total_wakeups, cached_top_json, cached_high_wakeups_json);
+                println!("{{\"cpu_temp\":{:.1},\"gpu_temp\":{:.1},\"mem_temp\":{:.1},\"ssd_temp\":{:.1},\"bat_temp\":{:.1},\"power_w\":{:.2},\"bat_power_w\":{:.2},\"mem_power_w\":{:.2},\"display_w\":{:.2},\"cpu_mw\":{},\"gpu_mw\":{},\"ane_mw\":{},\"wifi_mw\":{},\"battery_pct\":{},\"charging\":{},\"cycle_count\":{},\"health_pct\":{},\"mem_free_pct\":{},\"efficiency_hrs\":{:.1},\"wakeups_per_sec\":{:.0},\"top_cpu\":[{}],\"high_wakeups\":[{}]}}",
+                    cpu_avg, gpu_avg, mem_avg, ssd_avg, bat_avg, sys_power, bat_power, mem_power, display_w, (cpu_smc * 1000.0) as i32, (gpu_smc * 1000.0) as i32, (ane_smc * 1000.0) as i32, (wifi_smc * 1000.0) as i32, cached_battery_pct, cached_charging, cycle_count, health_pct, cached_mem_free_pct, cached_efficiency, cached_total_wakeups, cached_top_json, cached_high_wakeups_json);
                 
                 if mode == "json" { break; }
                 
