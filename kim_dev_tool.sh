@@ -70,6 +70,8 @@ sudo "$script_dir/kim_temp_bin" stream | while IFS= read -r line; do
     cpu_mw=$(echo "$line" | jq -r '.cpu_mw')
     gpu_mw=$(echo "$line" | jq -r '.gpu_mw')
     ane_mw=$(echo "$line" | jq -r '.ane_mw')
+    wifi_mw=$(echo "$line" | jq -r '.wifi_mw // 0')
+    ssd_mw=$(echo "$line" | jq -r '.ssd_mw // 0')
     
     battery_pct=$(echo "$line" | jq -r '.battery_pct')
     charging=$(echo "$line" | jq -r '.charging')
@@ -134,16 +136,23 @@ sudo "$script_dir/kim_temp_bin" stream | while IFS= read -r line; do
     # Note: PSTR includes CPU/GPU/ANE/Memory and Logic Board overhead
     # We subtract estimated components to find the "Losses/WiFi/Fan" overhead
     system_logic_mw=$(echo "$power_w * 1000" | bc -l | awk '{print int($1)}')
-    known_components=$((cpu_mw + gpu_mw + ane_mw + screen_mw))
+    known_components=$((cpu_mw + gpu_mw + ane_mw + wifi_mw + ssd_mw + screen_mw))
     misc_mw=$((system_logic_mw - known_components))
     [ "$misc_mw" -lt 0 ] && misc_mw=0
     
     printf "⚡ POWER:       %s W   (Total System)\033[K\n" "$real_total_w"
+    
+    printf "\033[1m   Silicon Power:\033[0m\033[K\n"
     printf "   ├─ CPU:     %5d mW\033[K\n" "$cpu_mw"
     printf "   ├─ GPU:     %5d mW\033[K\n" "$gpu_mw"
-    printf "   ├─ ANE:     %5d mW\033[K\n" "$ane_mw"
+    printf "   └─ ANE:     %5d mW\033[K\n" "$ane_mw"
+    
+    echo ""
+    printf "\033[1m   System Power:\033[0m\033[K\n"
+    printf "   ├─ WiFi:    %5d mW\033[K\n" "$wifi_mw"
+    printf "   ├─ SSD:     %5d mW\033[K\n" "$ssd_mw"
     printf "   ├─ Memory:  %5d mW\033[K\n" "$misc_mw"
-    printf "   └─ Disp+Sys:%5d mW   (Screen + WiFi/SSD/Idle)\033[K\n" "$screen_mw"
+    printf "   └─ Disp+Sys:%5d mW   (Screen + Fans + Idle)\033[K\n" "$screen_mw"
     
     echo ""
     
