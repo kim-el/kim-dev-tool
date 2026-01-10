@@ -73,6 +73,8 @@ sudo "$script_dir/kim_temp_bin" stream | while IFS= read -r line; do
     
     battery_pct=$(echo "$line" | jq -r '.battery_pct')
     charging=$(echo "$line" | jq -r '.charging')
+    cycle_count=$(echo "$line" | jq -r '.cycle_count')
+    health_pct=$(echo "$line" | jq -r '.health_pct')
     mem_free_pct=$(echo "$line" | jq -r '.mem_free_pct')
     efficiency_hrs=$(echo "$line" | jq -r '.efficiency_hrs')
     wakeups_per_sec=$(echo "$line" | jq -r '.wakeups_per_sec')
@@ -94,16 +96,9 @@ sudo "$script_dir/kim_temp_bin" stream | while IFS= read -r line; do
     # Battery Section
     is_charging="no"; [ "$charging" = "true" ] && is_charging="yes"
     
-    # Efficiency recalibration
-    if [ $(echo "$real_total_w > 0.5" | bc -l) -eq 1 ]; then
-        avg_100_hours=$(echo "$efficiency_hrs * $power_w / $real_total_w" | bc -l)
-    else
-        avg_100_hours="99.9"
-    fi
-    
     # Time Remaining
     if [ $(echo "$real_total_w > 0" | bc -l) -eq 1 ]; then
-        time_left_hrs=$(echo "$avg_100_hours * $battery_pct / 100" | bc -l)
+        time_left_hrs=$(echo "$efficiency_hrs * $battery_pct / 100" | bc -l)
         hrs_int=$(echo "$time_left_hrs" | awk '{print int($1)}')
         mins_int=$(echo "($time_left_hrs - $hrs_int) * 60" | bc -l | awk '{print int($1)}')
         time_remaining=$(printf "%d:%02d" "$hrs_int" "$mins_int")
@@ -114,16 +109,11 @@ sudo "$script_dir/kim_temp_bin" stream | while IFS= read -r line; do
     printf "🔋 BATTERY:    %3d%%   " "$battery_pct"
     if [ "$is_charging" = "yes" ]; then
         printf "\033[32m(Charging)\033[0m\033[K\n"
-    elif [ $(echo "$avg_100_hours >= 12" | bc -l) -eq 1 ]; then
-        printf "(@100%%: %.1fh) ✅\033[K\n" "$avg_100_hours"
-    elif [ $(echo "$avg_100_hours >= 6" | bc -l) -eq 1 ]; then
-        printf "\033[33m(@100%%: %.1fh)\033[0m\033[K\n" "$avg_100_hours"
     else
-        printf "\033[31m(@100%%: %.1fh - heavy!)\033[0m\033[K\n" "$avg_100_hours"
+        printf "(Cycle Count|Maximum Capacity: %d|%d%%)\033[K\n" "$cycle_count" "$health_pct"
     fi
     printf "   ├─ Power Draw:  %s W\033[K\n" "$real_total_w"
-    printf "   ├─ Time Left:   %s (est)\033[K\n" "$time_remaining"
-    printf "   └─ Live @100%%: %.1fh\033[K\n" "$avg_100_hours"
+    printf "   └─ Time Left:   %s (est)\033[K\n" "$time_remaining"
     
     echo ""
     

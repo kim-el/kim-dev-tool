@@ -76,9 +76,9 @@ fn calibrate_cpu_gpu_keys(smc: &SMC) -> Option<(four_char_code::FourCharCode, fo
     let gpu_valid = best_gpu_diff < 500.0 || best_gpu_diff < pm_gpu_mw * 0.5;
 
     if cpu_valid && gpu_valid {
-        // eprintln!("Calibration: CPU={} ({:.0}mW vs {:.0}mW), GPU={} ({:.0}mW vs {:.0}mW)", 
-        //     key_to_string(best_cpu_key), smc.read_key::<f32>(best_cpu_key).unwrap_or(0.0)*1000.0, pm_cpu_mw,
-        //     key_to_string(best_gpu_key), smc.read_key::<f32>(best_gpu_key).unwrap_or(0.0)*1000.0, pm_gpu_mw);
+        eprintln!("[Calibrated] CPU: {} ({:.0}mW), GPU: {} ({:.0}mW)", 
+            key_to_string(best_cpu_key), smc.read_key::<f32>(best_cpu_key).unwrap_or(0.0)*1000.0,
+            key_to_string(best_gpu_key), smc.read_key::<f32>(best_gpu_key).unwrap_or(0.0)*1000.0);
         Some((best_cpu_key, best_gpu_key))
     } else {
         // Fallback to standard M1 keys if calibration is wildly failing
@@ -104,7 +104,7 @@ fn main() {
     // Common Power Keys
     let pstr_key = string_to_key("PSTR"); // System Total (Logic)
     let ppbr_key = string_to_key("PPBR"); // Battery Rail (Physical Total)
-    let phps_key = string_to_key("PHPS"); // Package Total (SoC + some extras)
+    let _phps_key = string_to_key("PHPS"); // Package Total (SoC + some extras)
     let phpm_key = string_to_key("PHPM"); // Memory
     
     // Dynamic Calibration for CPU/GPU keys (M1 vs M2 vs M3 vs M4 compatibility)
@@ -156,7 +156,18 @@ fn main() {
         
         "json" | "stream" => {
             let ioreg_batt = std::process::Command::new("ioreg").args(["-r", "-c", "AppleSmartBattery"]).output().ok().and_then(|o| String::from_utf8(o.stdout).ok()).unwrap_or_default();
-            let battery_mah: f32 = ioreg_batt.lines().find(|l| l.contains("\"DesignCapacity\"")).and_then(|l| l.split('=').nth(1).and_then(|s| s.trim().parse().ok())).unwrap_or(4500.0);
+            let design_mah: f32 = ioreg_batt.lines().find(|l| l.contains("\"DesignCapacity\"") && l.contains('=')).and_then(|l| l.split('=').nth(1).and_then(|s| s.trim().parse().ok())).unwrap_or(4500.0);
+            let nominal_mah: f32 = ioreg_batt.lines().find(|l| l.contains("\"NominalChargeCapacity\"") && l.contains('=')).and_then(|l| l.split('=').nth(1).and_then(|s| s.trim().parse().ok())).unwrap_or(design_mah);
+            
+            // Fix: Find the exact "CycleCount" = line, ignoring the "BatteryData" blob
+            let cycle_count: i32 = ioreg_batt.lines()
+                .find(|l| l.trim().starts_with("\"CycleCount\" ="))
+                .and_then(|l| l.split('=').nth(1).and_then(|s| s.trim().parse().ok()))
+                .unwrap_or(0);
+                
+            let health_pct: i32 = ((nominal_mah / design_mah) * 100.0) as i32;
+
+            let battery_mah = nominal_mah;
             let battery_wh = battery_mah * 11.4 / 1000.0;
             
             let total_bytes: u64 = std::process::Command::new("sysctl").args(["-n", "hw.memsize"]).output().ok().and_then(|o| String::from_utf8(o.stdout).ok()).and_then(|s| s.trim().parse().ok()).unwrap_or(16 * 1024 * 1024 * 1024);
@@ -182,22 +193,13 @@ fn main() {
                 // --- FAST PATH (SMC) ---
                 let sys_power = smc.read_key::<f32>(pstr_key).unwrap_or(0.0);
                 let bat_power = smc.read_key::<f32>(ppbr_key).unwrap_or(0.0);
-                let phps = smc.read_key::<f32>(phps_key).unwrap_or(0.0);
                 let mem_power = smc.read_key::<f32>(phpm_key).unwrap_or(0.0);
                 let cpu_smc = smc.read_key::<f32>(pp0b_key).unwrap_or(0.0);
                 let gpu_smc = smc.read_key::<f32>(pp7b_key).unwrap_or(0.0);
                 
-                // Estimate Display Power using SMC only (Fast & Low Overhead)
-                // PSTR (Total) - PHPS (SoC Package) - PHPM (Memory)
-                // Note: PHPS usually includes CPU + GPU + ANE + Fabric.
-                // If PHPS is not available/accurate, we can use cpu_smc + gpu_smc.
-                // For now, let's stick to the subtraction method which proved accurate.
-                let mut display_w = (sys_power - phps - mem_power).max(0.0);
-                
-                // Fallback if PHPS is 0 (some M1 models?)
-                if phps < 0.1 {
-                     display_w = (sys_power - cpu_smc - gpu_smc - mem_power).max(0.0);
-                }
+                // Unified Silicon-Only Subtraction Formula
+                // Most accurate for M4 as it avoids the ambiguous PHPS rail.
+                let display_w = (sys_power - cpu_smc - gpu_smc - mem_power).max(0.0);
 
                 let mut cpu_temps = Vec::new(); let mut gpu_temps = Vec::new(); let mut mem_temps = Vec::new(); let mut ssd_temps = Vec::new(); let mut bat_temps = Vec::new();
                 for key in &keys {
@@ -275,8 +277,8 @@ fn main() {
                     cached_high_wakeups_json = processes.iter().filter(|(_,_,w)| *w > 50.0).take(5).map(|(n,c,w)| format!("{{\"name\":\"{}\",\"cpu_ms\":{:.1},\"wakeups\":{:.1}}}", n, c, w)).collect::<Vec<_>>().join(",");
                 }
 
-                println!("{{\"cpu_temp\":{:.1},\"gpu_temp\":{:.1},\"mem_temp\":{:.1},\"ssd_temp\":{:.1},\"bat_temp\":{:.1},\"power_w\":{:.2},\"bat_power_w\":{:.2},\"mem_power_w\":{:.2},\"display_w\":{:.2},\"cpu_mw\":{},\"gpu_mw\":{},\"ane_mw\":{},\"battery_pct\":{},\"charging\":{},\"mem_free_pct\":{},\"efficiency_hrs\":{:.1},\"wakeups_per_sec\":{:.0},\"top_cpu\":[{}],\"high_wakeups\":[{}]}}",
-                    cpu_avg, gpu_avg, mem_avg, ssd_avg, bat_avg, sys_power, bat_power, mem_power, display_w, cached_cpu_mw, cached_gpu_mw, cached_ane_mw, cached_battery_pct, cached_charging, cached_mem_free_pct, cached_efficiency, cached_total_wakeups, cached_top_json, cached_high_wakeups_json);
+                println!("{{\"cpu_temp\":{:.1},\"gpu_temp\":{:.1},\"mem_temp\":{:.1},\"ssd_temp\":{:.1},\"bat_temp\":{:.1},\"power_w\":{:.2},\"bat_power_w\":{:.2},\"mem_power_w\":{:.2},\"display_w\":{:.2},\"cpu_mw\":{},\"gpu_mw\":{},\"ane_mw\":{},\"battery_pct\":{},\"charging\":{},\"cycle_count\":{},\"health_pct\":{},\"mem_free_pct\":{},\"efficiency_hrs\":{:.1},\"wakeups_per_sec\":{:.0},\"top_cpu\":[{}],\"high_wakeups\":[{}]}}",
+                    cpu_avg, gpu_avg, mem_avg, ssd_avg, bat_avg, sys_power, bat_power, mem_power, display_w, cached_cpu_mw, cached_gpu_mw, cached_ane_mw, cached_battery_pct, cached_charging, cycle_count, health_pct, cached_mem_free_pct, cached_efficiency, cached_total_wakeups, cached_top_json, cached_high_wakeups_json);
                 
                 if mode == "json" { break; }
                 
@@ -298,16 +300,11 @@ fn main() {
                 let sys_power = smc.read_key::<f32>(pstr_key).unwrap_or(0.0);
                 let bat_power = smc.read_key::<f32>(ppbr_key).unwrap_or(0.0);
                 let mem_power = smc.read_key::<f32>(phpm_key).unwrap_or(0.0);
-                let phps = smc.read_key::<f32>(phps_key).unwrap_or(0.0);
                 let cpu_smc = smc.read_key::<f32>(pp0b_key).unwrap_or(0.0);
                 let gpu_smc = smc.read_key::<f32>(pp7b_key).unwrap_or(0.0);
 
-                // No powermetrics needed for simple monitor! 
-                let mut display_w = (sys_power - phps - mem_power).max(0.0);
-                // Fallback
-                if phps < 0.1 {
-                    display_w = (sys_power - cpu_smc - gpu_smc - mem_power).max(0.0);
-                }
+                // Unified Silicon-Only Subtraction
+                let display_w = (sys_power - cpu_smc - gpu_smc - mem_power).max(0.0);
                 
                 let mut cpu_temps = Vec::new();
                 for key in &keys {

@@ -27,6 +27,9 @@ A high-efficiency benchmarking tool for Apple Silicon, focusing on power (Watts)
     - Slow Path (5s): Run `powermetrics`, `pmset`, `vm_stat` to update process list and battery stats.
   - **M4 Support**: Added `calibrate_cpu_gpu_keys` to auto-detect the correct power sensors. On M4, it identified `PZD1` or `Pb0f` instead of the old `PP0b` standard.
   - **Verification**: CPU readings verified (400mW idle, 11W under 4-core load on M4).
+- **2026-01-10**: Fixed Battery Capacity Source.
+  - **Issue**: "Live @ 100%" used Factory Design Capacity, overestimating runtime on degraded batteries.
+  - **Fix**: Updated `kim_temp_bin` to prioritize `NominalChargeCapacity` (Real Health) over `DesignCapacity`.
 
 ## Known Issues
 - **2026-01-09**: Dynamic Calibration requires `sudo` (prompted at startup) because it runs a one-time `powermetrics` baseline.
