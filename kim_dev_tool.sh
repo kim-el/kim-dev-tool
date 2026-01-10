@@ -96,9 +96,16 @@ sudo "$script_dir/kim_temp_bin" stream | while IFS= read -r line; do
     # Battery Section
     is_charging="no"; [ "$charging" = "true" ] && is_charging="yes"
     
+    # Efficiency recalibration
+    if [ $(echo "$real_total_w > 0.5" | bc -l) -eq 1 ]; then
+        avg_100_hours=$(echo "$efficiency_hrs * $power_w / $real_total_w" | bc -l)
+    else
+        avg_100_hours="99.9"
+    fi
+    
     # Time Remaining
     if [ $(echo "$real_total_w > 0" | bc -l) -eq 1 ]; then
-        time_left_hrs=$(echo "$efficiency_hrs * $battery_pct / 100" | bc -l)
+        time_left_hrs=$(echo "$avg_100_hours * $battery_pct / 100" | bc -l)
         hrs_int=$(echo "$time_left_hrs" | awk '{print int($1)}')
         mins_int=$(echo "($time_left_hrs - $hrs_int) * 60" | bc -l | awk '{print int($1)}')
         time_remaining=$(printf "%d:%02d" "$hrs_int" "$mins_int")
@@ -113,7 +120,8 @@ sudo "$script_dir/kim_temp_bin" stream | while IFS= read -r line; do
         printf "(Cycle Count|Maximum Capacity: %d|%d%%)\033[K\n" "$cycle_count" "$health_pct"
     fi
     printf "   ├─ Power Draw:  %s W\033[K\n" "$real_total_w"
-    printf "   └─ Time Left:   %s (est)\033[K\n" "$time_remaining"
+    printf "   ├─ Time Left:   %s (est)\033[K\n" "$time_remaining"
+    printf "   └─ Live @100%%: %.1fh\033[K\n" "$avg_100_hours"
     
     echo ""
     
